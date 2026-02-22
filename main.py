@@ -1,138 +1,143 @@
-import asyncio
-import re
+import json
+import os
 import time
+import subprocess
+import asyncio
 import aiohttp
-from aiohttp_socks import ProxyConnector
 
-# --- CONFIGURATION (Boss, you can edit these limits here) ---
-LIMIT_FAST = 200     # Elite/Gemini limit in ms
-LIMIT_BRAVE = 300    # General working limit in ms
-TIMEOUT_TOTAL = 5    # Total connection timeout in seconds
+# --- CONFIGURATION (Boss, you can tune these) ---
+INPUT_FILE = "raw_links.txt"   # Where the primary bot stores raw links
+CACHE_FILE = "dead_cache.txt"   # IDs of nodes that failed tests
+CLEANUP_LOG = "last_cleanup.txt"
 
-CHECK_URL_GEMINI = "https://gemini.google.com/app"
-CHECK_URL_GENERIC = "https://www.google.com"
+# Thresholds for sorting
+MAX_PING = 300       # Max allowed ping for "Stable Reserve"
+ELITE_PING = 150     # Max ping for "Elite"
+SPEED_MIN = 3.0      # Min speed in Mbps for "Speed Master"
 
-SOURCE_FILE = "my_stable_configs.txt"
-
-# Output Files
-FILES = {
-    "fast": "sub_fast.txt",   # Gemini + < 200ms
-    "elite": "sub_elite.txt", # YouTube/Streaming + < 200ms
-    "brave": "sub_brave.txt", # Working + < 300ms
-    "cis": "sub_cis.txt",     # Kazakhstan/Belarus (Any speed)
-    "raw": "sub_raw.txt"      # Archive for working but slow
-}
-
-# State management
-processed_urls = set()
-stats = {"fast": 0, "elite": 0, "brave": 0, "cis": 0, "raw": 0, "failed": 0}
-
-async def check_proxy(proxy_url, test_url):
-    """
-    Universal checker using ProxyConnector.
-    Measures Latency and Status Code.
-    """
-    start_time = time.perf_counter()
-    try:
-        # Auto-detect protocol from string
-        connector = ProxyConnector.from_url(proxy_url)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            # We use HEAD for speed and to avoid heavy data usage
-            async with session.head(test_url, timeout=aiohttp.ClientTimeout(total=TIMEOUT_TOTAL), allow_redirects=True) as resp:
-                if resp.status < 400:
-                    latency = (time.perf_counter() - start_time) * 1000
-                    return latency
-    except Exception:
-        return None
-    return None
-
-async def process_single_config(line, semaphore):
-    """
-    Logic for a single proxy config line.
-    """
-    line = line.strip()
-    if not line or "#" not in line:
-        return
-
-    async with semaphore:
-        # 1. Parse Country Code from Remark [XX]
-        match = re.search(r'\[([A-Z]{2})\]', line)
-        country_code = match.group(1) if match else "XX"
-
-        # 2. CIS Mode (KZ/BY) - Speed doesn't matter, only access
-        if country_code in ["KZ", "BY"]:
-            lat = await check_proxy(line, CHECK_URL_GENERIC)
-            if lat:
-                save_result("cis", line)
-                return
-
-        # 3. Stage I: Speed Test (General Access)
-        # We do 2 attempts to get a stable average
-        latencies = []
-        for _ in range(2):
-            l = await check_proxy(line, CHECK_URL_GENERIC)
-            if l: latencies.append(l)
-        
-        if not latencies:
-            stats["failed"] += 1
-            return
-            
-        avg_lat = sum(latencies) / len(latencies)
-
-        # 4. Strict Filtering Logic
-        if avg_lat > LIMIT_BRAVE:
-            save_result("raw", line)
-            return
-
-        # 5. Stage II: Gemini Check (For fast proxies)
-        # Check if Google allows this IP to access Gemini
-        is_gemini_ok = await check_proxy(line, CHECK_URL_GEMINI)
-
-        # 6. Final Distribution (Unique)
-        if is_gemini_ok and avg_lat <= LIMIT_FAST:
-            save_result("fast", line)
-        elif avg_lat <= LIMIT_FAST:
-            save_result("elite", line)
-        elif avg_lat <= LIMIT_BRAVE:
-            save_result("brave", line)
-        else:
-            save_result("raw", line)
-
-def save_result(category, data):
-    """Safe write to file and update stats."""
-    stats[category] += 1
-    with open(FILES[category], "a", encoding="utf-8") as f:
-        f.write(data + "\n")
-
-async def main():
-    # Clean up previous results
-    for path in FILES.values():
-        with open(path, "w", encoding="utf-8") as f:
-            f.truncate(0)
-
-    try:
-        with open(SOURCE_FILE, "r", encoding="utf-8") as f:
-            configs = [l.strip() for l in f if l.strip()]
-    except FileNotFoundError:
-        print(f"❌ Error: {SOURCE_FILE} not found!")
-        return
-
-    print(f"🚀 Starting Level 2 Check for {len(configs)} configs...")
-    print(f"⚙️ Limits: Fast <{LIMIT_FAST}ms, Brave <{LIMIT_BRAVE}ms")
-
-    # Limit concurrent tasks to 50 to avoid local port exhaustion
-    semaphore = asyncio.Semaphore(50)
-    tasks = [process_single_config(cfg, semaphore) for cfg in configs]
+# --- 1. CACHE MANAGEMENT (72-hour cycle) ---
+def manage_cache_lifecycle():
+    """Removes cache and old files every 3 days to refresh the pool."""
+    now = time.time()
+    three_days = 259200 # seconds
     
-    await asyncio.gather(*tasks)
+    if os.path.exists(CLEANUP_LOG):
+        with open(CLEANUP_LOG, "r") as f:
+            last_clean = float(f.read().strip())
+    else:
+        last_clean = 0
+        
+    if now - last_clean > three_days:
+        print("[System] 72h Cleanup triggered. Clearing cache...")
+        if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+        # Clear output files to ensure fresh overwrite
+        for f in ["Elite_Gemini.txt", "Speed_Master.txt", "Stable_Reserve.txt"]:
+            if os.path.exists(f): os.remove(f)
+            
+        with open(CLEANUP_LOG, "w") as f:
+            f.write(str(now))
 
-    # Output final summary
-    print("\n" + "="*30)
-    print("📊 FINAL STATISTICS:")
-    for cat, count in stats.items():
-        print(f" - {cat.upper()}: {count}")
-    print("="*30)
-    print("✅ Done! Files updated.")
+# --- 2. INPUT PROCESSING ---
+def load_and_filter_input():
+    """Reads raw links and filters out duplicates and cached dead nodes."""
+    if not os.path.exists(INPUT_FILE):
+        return []
+    
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        links = list(set(line.strip() for line in f if line.strip()))
+    
+    dead_pool = set()
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r") as f:
+            dead_pool = set(line.strip() for line in f if line.strip())
+            
+    # Filter: keep only links not in the dead pool
+    # We use a simple hash of the link as an ID
+    filtered = [l for l in links if str(hash(l)) not in dead_pool]
+    return filtered
+
+# --- 3. LITESPEEDTEST CORE INTEGRATION ---
+def execute_lite_benchmark():
+    """Runs the LiteSpeedTest binary and parses JSON results."""
+    # We create a temporary file for LiteSpeedTest to read
+    temp_input = "temp_batch.txt"
+    links = load_and_filter_input()
+    
+    if not links:
+        print("[System] No new links to process.")
+        return []
+
+    with open(temp_input, "w") as f:
+        f.write("\n".join(links))
+
+    print(f"[System] Starting LiteSpeedTest for {len(links)} nodes...")
+    
+    # Run the binary. 
+    # -f: input file, -p: test url, -o: output format
+    subprocess.run([
+        "./lite-speedtest",
+        "-f", temp_input,
+        "-p", "https://gemini.google.com",
+        "-o", "json"
+    ], capture_output=True)
+
+    results_file = "result.json"
+    if not os.path.exists(results_file):
+        return []
+
+    with open(results_file, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except:
+            return []
+
+# --- 4. CLASSIFICATION & OVERWRITE ---
+def triple_tier_classifier():
+    """Sorts tested nodes into 3 files based on performance and Gemini access."""
+    nodes = execute_lite_benchmark()
+    
+    elite_gemini = []
+    speed_master = []
+    stable_reserve = []
+    dead_ids = []
+
+    for node in nodes:
+        link = node.get("link")
+        ping = node.get("ping", 999)
+        speed = node.get("speed", 0)
+        # google_check depends on the binary output for the specific URL
+        gemini_ok = node.get("google_check", False)
+
+        node_id = str(hash(link))
+
+        if ping >= MAX_PING or ping == 0:
+            dead_ids.append(node_id)
+            continue
+
+        # Tier 1: Elite (Fast + Gemini)
+        if ping < ELITE_PING and gemini_ok:
+            elite_gemini.append(link)
+        # Tier 2: Speed Master (Fast, but no Gemini)
+        elif ping < 200 and speed > SPEED_MIN:
+            speed_master.append(link)
+        # Tier 3: Stable Reserve (Slow but alive)
+        elif ping < MAX_PING:
+            stable_reserve.append(link)
+
+    # Overwrite output files
+    with open("Elite_Gemini.txt", "w") as f:
+        f.write("\n".join(elite_gemini))
+    with open("Speed_Master.txt", "w") as f:
+        f.write("\n".join(speed_master))
+    with open("Stable_Reserve.txt", "w") as f:
+        f.write("\n".join(stable_reserve))
+
+    # Update dead cache (Append mode)
+    if dead_ids:
+        with open(CACHE_FILE, "a") as f:
+            f.write("\n".join(dead_ids) + "\n")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    manage_cache_lifecycle()
+    triple_tier_classifier()
+    print("[System] Sieve process finished successfully.")
