@@ -11,8 +11,8 @@ from datetime import datetime
 
 # --- CONFIGURATION & PATHS ---
 RAW_FILES = ['sub_raw.txt', 'my_personal_links.txt']
-# Поиск бинарника в разных местах
-LST_BINARY_NAMES = ["./lite-speedtest", "lite-speedtest", "./bin/lite-speedtest"]
+# Поиск бинарника в разных местах (теперь ищем и в корне, и в /usr/local/bin)
+LST_BINARY_NAMES = ["./lite-speedtest", "lite-speedtest", "/usr/local/bin/lite-speedtest"]
 STATUS_FILE = 'status.json'
 
 # Output Files
@@ -54,18 +54,19 @@ class EliteFactoryLST:
     def find_binary(self):
         """Находит путь к бинарнику LST и проверяет права."""
         for name in LST_BINARY_NAMES:
-            if os.path.exists(name) or subprocess.call(f"command -v {name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
-                self.binary_path = name
-                # Пытаемся дать права на выполнение на всякий случай
-                try:
+            try:
+                # Проверяем существование файла или наличие в PATH через which
+                is_in_path = subprocess.call(f"command -v {name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+                if os.path.exists(name) or is_in_path:
+                    self.binary_path = name
                     if os.path.exists(name):
                         os.chmod(name, 0o755)
-                except: pass
-                self.log(f"System: Найден бинарник {name}")
-                return True
+                    self.log(f"System: Найден бинарник {name}")
+                    return True
+            except: continue
         
         self.log("❌ ERROR: Бинарник LiteSpeedTest не найден!")
-        self.log(f"Files in current dir: {os.listdir('.')}")
+        self.log(f"Directory Content: {os.listdir('.')}")
         return False
 
     def fetch_remote_content(self, url):
@@ -143,13 +144,13 @@ class EliteFactoryLST:
         try:
             # LST Command: -sub (input file), -test (target), -out (output format)
             cmd = [self.binary_path, "-sub", "batch.txt", "-test", "google", "-out", "json"]
-            subprocess.run(cmd, capture_output=True, timeout=360)
+            subprocess.run(cmd, capture_output=True, timeout=400)
             
             if os.path.exists("output.json"):
                 with open("output.json", "r", encoding='utf-8') as f:
                     return json.load(f)
             else:
-                self.log("LST: Файл output.json не был создан.")
+                self.log("LST: Файл output.json не был создан. Возможно, LST упал или не запустился.")
         except Exception as e:
             self.log(f"LST Core Error: {e}")
             self.stats["errors"].append(str(e))
@@ -206,7 +207,7 @@ class EliteFactoryLST:
         results = self.run_lst_check(alive_links)
         
         # 5. Advanced Sorting & Tiering
-        if results:
+        if results and isinstance(results, list):
             for node in results:
                 url = node.get('url')
                 speed = node.get('speed', 0) # Mbps
@@ -232,7 +233,7 @@ class EliteFactoryLST:
                     self.final_results['slow'].append(url)
         else:
             # Fallback: если LST не сработал, просто кладем живые TCP в Brave/Slow по странам
-            self.log("System: Работа в режиме Fallback (только TCP данные)")
+            self.log("System: Работа в режиме Fallback (LST не дал результатов)")
             for url in alive_links:
                 country = self.parse_country(url)
                 if country == 'KZ': self.final_results['kz'].append(url)
