@@ -2,24 +2,25 @@ name: Elite Proxy Factory
 
 on:
   schedule:
-    - cron: "27 */3 * * *"
+    # Запуск каждые 3 часа на 27-й минуте (синхронно с твоим примером)
+    - cron: '27 */3 * * *'
   push:
+    # Мгновенный запуск при обновлении сырых ссылок
     paths:
-      - "sub_raw.txt"
+      - 'sub_raw.txt'
   workflow_dispatch:
     inputs:
       full_audit:
-        description: "Perform deep L7 audit?"
+        description: 'Perform deep L7 audit?'
         required: false
-        default: "false"
+        default: 'false'
         type: boolean
 
-permissions:
-  contents: write
-
 jobs:
-  check_and_deploy:
+  check-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -27,7 +28,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Cache Xray Engine
         id: cache-xray
@@ -43,8 +44,9 @@ jobs:
           unzip Xray-linux-64.zip xray
           chmod +x xray
 
-      - name: Install Dependencies
-        run: pip install requests
+      - name: Install dependencies
+        run: |
+          pip install requests
 
       - name: Execute Factory Engine
         run: |
@@ -56,15 +58,18 @@ jobs:
             python main.py
           fi
 
-      - name: Push Results to Repository
+      - name: Commit and Force Push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name "EliteFactoryBot"
           git config --global user.email "bot@github.com"
           
+          # Добавляем результаты проверки
           git add sub_*.txt base64_*.txt status.json
           
+          # Форсированный коммит с датой
           git commit -m "Auto-Update: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
           
+          # Пуш в основную ветку
           git push origin main
