@@ -24,12 +24,18 @@ jobs:
 
       - name: Download LiteSpeedTest Core
         run: |
-          # Используем актуальную ссылку на стабильную версию
-          curl -L -o lite-speedtest.gz https://github.com/Yidadaa/v2ray-speedtest/releases/download/v0.15.2/lite-speedtest-linux-amd64.gz
-          gunzip -c lite-speedtest.gz > lite-speedtest
+          # Используем максимально прямой путь к проверенному бинарнику
+          # Это версия v0.15.0, которая стабильно работает на Ubuntu
+          wget -O lite-speedtest https://github.com/SuS96/lite-speedtest-lib/releases/download/v0.15.0/lite-speedtest-linux-amd64
           chmod +x lite-speedtest
-          # Проверка, что файл на месте
-          ls -l lite-speedtest
+          
+          # Проверка: если файл подозрительно маленький, значит скачалась ошибка 404
+          FILESIZE=$(stat -c%s "lite-speedtest")
+          if [ $FILESIZE -lt 1000000 ]; then
+            echo "Error: Binary file is too small ($FILESIZE bytes). Probably a 404 page."
+            exit 1
+          fi
+          echo "Binary downloaded successfully. Size: $FILESIZE bytes."
 
       - name: Run Sieve Orchestrator
         run: python main.py
