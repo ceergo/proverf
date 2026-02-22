@@ -11,7 +11,8 @@ from datetime import datetime
 
 # --- CONFIGURATION & PATHS ---
 RAW_FILES = ['sub_raw.txt', 'my_personal_links.txt']
-LST_BINARY = "./lite-speedtest"
+# Поиск бинарника в разных местах
+LST_BINARY_NAMES = ["./lite-speedtest", "lite-speedtest", "./bin/lite-speedtest"]
 STATUS_FILE = 'status.json'
 
 # Output Files
@@ -39,14 +40,33 @@ class EliteFactoryLST:
             "tcp_alive": 0,
             "google_ok": 0,
             "elite_count": 0,
-            "last_run": datetime.now().isoformat()
+            "last_run": datetime.now().isoformat(),
+            "errors": []
         }
         self.unique_map = {} # host:port -> original_url
         self.final_results = {k: [] for k in SUBS.keys()}
+        self.binary_path = None
 
     def log(self, msg):
         """Standardized logger for GitHub Actions console."""
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚙️ {msg}")
+
+    def find_binary(self):
+        """Находит путь к бинарнику LST и проверяет права."""
+        for name in LST_BINARY_NAMES:
+            if os.path.exists(name) or subprocess.call(f"command -v {name}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                self.binary_path = name
+                # Пытаемся дать права на выполнение на всякий случай
+                try:
+                    if os.path.exists(name):
+                        os.chmod(name, 0o755)
+                except: pass
+                self.log(f"System: Найден бинарник {name}")
+                return True
+        
+        self.log("❌ ERROR: Бинарник LiteSpeedTest не найден!")
+        self.log(f"Files in current dir: {os.listdir('.')}")
+        return False
 
     def fetch_remote_content(self, url):
         """
@@ -111,6 +131,9 @@ class EliteFactoryLST:
     def run_lst_check(self, links):
         """Runs LiteSpeedTest binary to check real internet access (Google)."""
         if not links: return []
+        if not self.binary_path:
+            self.log("LST: Пропуск теста (бинарник отсутствует)")
+            return []
         
         with open("batch.txt", "w", encoding='utf-8') as f:
             f.write("\n".join(links))
@@ -119,20 +142,26 @@ class EliteFactoryLST:
         
         try:
             # LST Command: -sub (input file), -test (target), -out (output format)
-            cmd = [LST_BINARY, "-sub", "batch.txt", "-test", "google", "-out", "json"]
+            cmd = [self.binary_path, "-sub", "batch.txt", "-test", "google", "-out", "json"]
             subprocess.run(cmd, capture_output=True, timeout=360)
             
             if os.path.exists("output.json"):
                 with open("output.json", "r", encoding='utf-8') as f:
                     return json.load(f)
+            else:
+                self.log("LST: Файл output.json не был создан.")
         except Exception as e:
             self.log(f"LST Core Error: {e}")
+            self.stats["errors"].append(str(e))
         return []
 
     def start_process(self):
         """Main execution flow: Load -> Fetch -> Dedupe -> Test -> Sort."""
         self.log("--- СТАРТ ЗАВОДА ELITE LST (Smart Fetch) ---")
         
+        # 0. Поиск бинарника
+        self.find_binary()
+
         # 1. Loading & Recursive Fetching
         all_raw_lines = []
         for f_path in RAW_FILES:
@@ -177,45 +206,44 @@ class EliteFactoryLST:
         results = self.run_lst_check(alive_links)
         
         # 5. Advanced Sorting & Tiering
-        for node in results:
-            url = node.get('url')
-            speed = node.get('speed', 0) # Mbps
-            google_ping = node.get('google_ping', 0)
-            google_ok = google_ping > 0
-            country = self.parse_country(url)
-            
-            # Country-specific folders
-            if country == 'KZ':
-                self.final_results['kz'].append(url)
-            elif country == 'BY':
-                self.final_results['by'].append(url)
-            
-            # Connectivity-based folders
-            if google_ok:
-                self.stats["google_ok"] += 1
+        if results:
+            for node in results:
+                url = node.get('url')
+                speed = node.get('speed', 0) # Mbps
+                google_ping = node.get('google_ping', 0)
+                google_ok = google_ping > 0
+                country = self.parse_country(url)
                 
-                # Gemini/AI Folder (All working Google nodes)
-                self.final_results['gemini'].append(url)
+                if country == 'KZ': self.final_results['kz'].append(url)
+                elif country == 'BY': self.final_results['by'].append(url)
                 
-                # Performance Tiers
-                if speed > 50:
-                    self.final_results['elite'].append(url)
-                    self.stats["elite_count"] += 1
-                elif speed > 10:
-                    self.final_results['fast'].append(url)
-                
-                # Brave Mix (100-160ms range)
-                if 100 <= google_ping <= 165:
-                    self.final_results['brave'].append(url)
-            else:
-                self.final_results['slow'].append(url)
+                if google_ok:
+                    self.stats["google_ok"] += 1
+                    self.final_results['gemini'].append(url)
+                    if speed > 50:
+                        self.final_results['elite'].append(url)
+                        self.stats["elite_count"] += 1
+                    elif speed > 10:
+                        self.final_results['fast'].append(url)
+                    
+                    if 100 <= google_ping <= 165:
+                        self.final_results['brave'].append(url)
+                else:
+                    self.final_results['slow'].append(url)
+        else:
+            # Fallback: если LST не сработал, просто кладем живые TCP в Brave/Slow по странам
+            self.log("System: Работа в режиме Fallback (только TCP данные)")
+            for url in alive_links:
+                country = self.parse_country(url)
+                if country == 'KZ': self.final_results['kz'].append(url)
+                elif country == 'BY': self.final_results['by'].append(url)
+                self.final_results['brave'].append(url)
 
         # 6. Save & Export
         for tier, filename in SUBS.items():
             content = "\n".join(self.final_results[tier])
             with open(filename, "w", encoding='utf-8') as f:
                 f.write(content)
-            # Generate Base64 version for subscription apps
             with open(f"b64_{filename}", "w", encoding='utf-8') as f:
                 f.write(base64.b64encode(content.encode()).decode())
 
