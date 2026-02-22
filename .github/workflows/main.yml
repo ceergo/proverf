@@ -2,8 +2,12 @@ name: Elite Proxy Factory
 
 on:
   schedule:
-    - cron: "0 * * * *"
-    - cron: "0 */6 * * *"
+    # Запуск в 27-ю минуту каждого 3-го часа (как в твоем примере)
+    - cron: "27 */3 * * *"
+  push:
+    # Мгновенный запуск, если ты обновил список сырых ссылок
+    paths:
+      - "sub_raw.txt"
   workflow_dispatch:
     inputs:
       full_audit:
@@ -19,11 +23,11 @@ jobs:
   check_and_deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -44,20 +48,27 @@ jobs:
       - name: Install Dependencies
         run: pip install requests
 
-      - name: Run Proxy Factory Engine
+      - name: Execute Factory Engine
         run: |
-          if [[ "${{ github.event.schedule }}" == "0 */6 * * *" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
-            echo "RUNNING FULL L7 AUDIT..."
+          if [[ "${{ github.event_name }}" == "push" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
+            echo "RUNNING FULL AUDIT MODE..."
             python main.py --full
           else
-            echo "RUNNING HOURLY SYNC..."
+            echo "RUNNING STANDARD MODE..."
             python main.py
           fi
 
       - name: Push Results to Repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config --local user.email "factory@proxy.bot"
-          git config --local user.name "Elite Factory Bot"
+          git config --global user.name "EliteFactoryBot"
+          git config --global user.email "bot@github.com"
+          
+          # Добавляем все сгенерированные файлы подписок и статус
           git add sub_*.txt base64_*.txt status.json
-          git commit -m "🔄 Update: Verified Subscriptions [skip ci]" || exit 0
-          git push
+          
+          # Коммит с датой для истории обновлений
+          git commit -m "Auto-Update: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
+          
+          git push origin main
