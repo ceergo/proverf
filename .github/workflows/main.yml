@@ -1,43 +1,77 @@
-name: Extreme Proxy Update
+name: Proxy Multi-Sieve Inspector (Triggered)
 
 on:
-  schedule:
-    - cron: '27 */3 * * *'
-  push:
-    paths:
-      - 'my_personal_links.txt'
+  repository_dispatch:
+    types: [proxy_updated]
   workflow_dispatch:
 
 jobs:
-  update-proxies:
+  sieve_process:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          pip install requests maxminddb
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Execute Worker
-        run: python worker.py
-
-      - name: Commit and Force Push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Smart Download Latest Core (StairS)
         run: |
-          git config --global user.name "ExtremeProxyBot"
-          git config --global user.email "bot@github.com"
+          # Динамический поиск самого свежего релиза через GitHub API
+          # Мы используем проект StairS как самый ликвидный (обновления 2024-2025)
+          REPO="StairS/lite-speedtest"
+          API_URL="https://api.github.com/repos/$REPO/releases/latest"
           
-          # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Добавляем все выходные файлы, чтобы они не были пустыми в репозитории
-          git add my_stable_configs.txt BY_stable.txt KZ_stable.txt my_personal_links.txt activity_log.txt proxy_cache.json
+          echo "Fetching metadata for latest release of $REPO..."
           
-          git commit -m "Auto-Pulse: $(date +'%Y-%m-%d %H:%M') [Extreme Mode]" --allow-empty
-          git push origin main
+          # Находим URL ассета, который содержит 'linux' и 'amd64' и заканчивается на .tar.gz или .gz
+          DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
+          
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            echo "Error: Could not find a valid linux-amd64 binary in the latest release!"
+            exit 1
+          fi
+          
+          echo "Found latest version. Downloading from: $DOWNLOAD_URL"
+          curl -L -o core_archive "$DOWNLOAD_URL"
+          
+          # Распаковка в зависимости от расширения
+          if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
+            tar -xvf core_archive
+          else
+            gunzip -c core_archive > lite-speedtest
+          fi
+          
+          # Находим сам бинарник (он может быть переименован или лежать в подпапке)
+          # Логика: ищем файл, который начинается на lite-speedtest, является файлом и не имеет расширений архивов
+          find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
+          
+          chmod +x lite-speedtest
+          
+          # Проверка работоспособности
+          if [ ! -x "./lite-speedtest" ]; then
+            echo "Critical Error: Binary not found or not executable!"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Success: Modern core is ready. Size: $(stat -c%s lite-speedtest) bytes."
+
+      - name: Run Sieve Orchestrator
+        run: python main.py
+
+      - name: Commit and Push Results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "Elite-Inspector-Bot"
+          git add .
+          # Фиксируем результаты только если они изменились
+          git commit -m "Deep Audit Complete (Auto-Updated Core): $(date)" || exit 0
+          git push
