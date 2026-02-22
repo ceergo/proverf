@@ -2,20 +2,19 @@ name: Elite Proxy Factory
 
 on:
   schedule:
-    - cron: '0 * * * *'    # Раз в час (инкрементально - только новые)
-    - cron: '0 */6 * * *'  # Раз в 6 часов (полная чистка всей базы)
-  workflow_dispatch:        # Ручной запуск кнопкой
+    - cron: '0 * * * *'     # Раз в час (инкрементально)
+    - cron: '0 */6 * * *'   # Раз в 6 часов (полная чистка)
+  workflow_dispatch:        # Ручной запуск
     inputs:
       full_audit:
         description: 'Run Full Audit? (Check everything)'
         required: false
-        default: 'false'
+        default: false
         type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Даем права на запись, чтобы бот мог обновлять файлы подписок
     permissions:
       contents: write
       
@@ -24,13 +23,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Cache Xray Binary
         id: cache-xray
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ./xray
           key: ${{ runner.os }}-xray-v1.8.4
@@ -47,8 +46,8 @@ jobs:
 
       - name: Run Proxy Factory
         run: |
-          # Если запуск по расписанию раз в 6 часов или нажат флаг Full Audit
-          if [[ "${{ github.event.schedule }}" == "0 */6 * * *" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
+          # Логика определения типа запуска
+          if [ "${{ github.event.schedule }}" == "0 */6 * * *" ] || [ "${{ github.event.inputs.full_audit }}" == "true" ]; then
             echo "Running FULL AUDIT..."
             python main.py --full
           else
@@ -60,7 +59,11 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Bot"
-          # Добавляем все текстовые файлы и base64 подписки
-          git add sub_*.txt base64_*.txt || true
-          git commit -m "🚀 Auto-update: Elite Subscriptions [skip ci]" || exit 0
+          # Добавляем файлы, если они существуют
+          git add sub_*.txt base64_*.txt 2>/dev/null || true
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "🚀 Auto-update: Elite Subscriptions [skip ci]"
           git push
