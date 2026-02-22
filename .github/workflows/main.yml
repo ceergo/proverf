@@ -2,12 +2,12 @@ name: Elite Proxy Factory
 
 on:
   schedule:
-    # Runs at 27th minute of every 3rd hour
+    # Запуск в 27-ю минуту каждого 3-го часа
     - cron: '27 */3 * * *'
   push:
-    # Trigger immediately when you save raw links
+    # Мгновенный запуск при обновлении твоих личных ссылок
     paths:
-      - 'sub_raw.txt'
+      - 'my_personal_links.txt'
   workflow_dispatch:
     inputs:
       full_audit:
@@ -46,12 +46,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests
+          pip install requests maxminddb
 
-      - name: Execute Factory Engine
+      - name: Step 1: Execute Mega Worker (TCP & GeoIP)
+        run: python worker.py
+
+      - name: Step 2: Execute Deep Inspector (HTTP & Latency)
         run: |
           if [[ "${{ github.event_name }}" == "push" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
             echo "RUNNING FULL AUDIT MODE..."
+            # Здесь вызывается второй бот (убедись, что файл называется main.py или измени имя)
             python main.py --full
           else
             echo "RUNNING STANDARD MODE..."
@@ -65,11 +69,11 @@ jobs:
           git config --global user.name "EliteFactoryBot"
           git config --global user.email "bot@github.com"
           
-          # Add results
-          git add sub_*.txt base64_*.txt status.json
+          # Добавляем все результаты работы обоих ботов
+          git add my_stable_configs.txt my_personal_links.txt activity_log.txt sub_*.txt base64_*.txt status.json
           
-          # Force commit even if proxy list hasn't changed
+          # Фиксируем изменения с меткой пульса
           git commit -m "Auto-Pulse: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
           
-          # Push to the main branch
+          # Пушим в основную ветку
           git push origin main
