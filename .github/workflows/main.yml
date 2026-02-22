@@ -2,10 +2,8 @@ name: Elite Proxy Factory
 
 on:
   schedule:
-    # Запуск в 27-ю минуту каждого 3-го часа (как в твоем примере)
-    -cron: "27 */3 * * *"
+    - cron: "27 */3 * * *"
   push:
-    # Мгновенный запуск, если ты обновил список сырых ссылок
     paths:
       - "sub_raw.txt"
   workflow_dispatch:
@@ -65,10 +63,8 @@ jobs:
           git config --global user.name "EliteFactoryBot"
           git config --global user.email "bot@github.com"
           
-          # Добавляем все сгенерированные файлы подписок и статус
           git add sub_*.txt base64_*.txt status.json
           
-          # Коммит с датой для истории обновлений
           git commit -m "Auto-Update: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
           
           git push origin main
