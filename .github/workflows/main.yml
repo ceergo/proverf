@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       full_audit:
-        description: 'Full Audit?'
+        description: 'Run Full Audit?'
         type: boolean
         default: false
 
@@ -17,23 +17,29 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install
+
+      - name: Deps
         run: pip install requests
-      - name: Run
+
+      - name: Run Script
         run: |
           if [ "${{ github.event.inputs.full_audit }}" == "true" ]; then
             python main.py --full
           else
             python main.py
           fi
+
       - name: Push
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add .
-          git commit -m "Update" || exit 0
+          git commit -m "🚀 Auto-update [skip ci]" || exit 0
           git push
