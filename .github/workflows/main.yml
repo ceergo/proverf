@@ -22,100 +22,77 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Deep Multi-Version Search & Download
+      - name: Ultimate Robust Core Download
         run: |
-          # Список надежных репозиториев
-          REPOS=("StairS/lite-speedtest" "xxf002/lite-speedtest" "Yidadaa/v2ray-speedtest")
           SUCCESS=false
 
-          echo "Step 1: Deep Search through multiple releases..."
-          
-          for REPO in "${REPOS[@]}"; do
-            if [ "$SUCCESS" = true ]; then break; fi
-            
-            echo "-----------------------------------------------"
-            echo "Searching in repository: $REPO"
-            
-            # Запрашиваем список последних 5 релизов (вместо одного latest)
-            API_URL="https://api.github.com/repos/$REPO/releases?per_page=5"
-            RESPONSE=$(curl -sSL $API_URL)
-            
-            # Проверка на Rate Limit или пустой ответ
-            if echo "$RESPONSE" | jq -e '.message' > /dev/null || [ "$RESPONSE" == "[]" ]; then
-               echo "API unavailable or empty for $REPO. Skipping to next repo..."
-               continue
+          # 1. Сначала пробуем "Умные" прямые ссылки (не зависят от API и Rate Limits)
+          # Это формат, который GitHub всегда редиректит на актуальную версию
+          DIRECT_URLS=(
+            "https://github.com/StairS/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.tar.gz"
+            "https://github.com/xxf002/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.gz"
+            "https://github.com/StairS/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.gz"
+            "https://github.com/xxf002/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.tar.gz"
+          )
+
+          echo "Step 1: Trying Direct 'Latest' Downloads (Bypassing API)..."
+          for DURL in "${DIRECT_URLS[@]}"; do
+            echo "Checking: $DURL"
+            if curl -f -L -o core_archive "$DURL"; then
+              echo "Success! Downloaded from direct link."
+              SUCCESS=true
+              DOWNLOAD_URL=$DURL
+              break
             fi
-
-            # Получаем список всех подходящих ссылок из последних 5 релизов
-            # Собираем все URL ассетов, которые содержат linux и amd64
-            mapfile -t URLS < <(echo "$RESPONSE" | jq -r '.[].assets[]? | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url')
-
-            if [ ${#URLS[@]} -eq 0 ]; then
-              echo "No valid assets found in the last 5 releases of $REPO."
-              continue
-            fi
-
-            # Пробуем каждую найденную версию по порядку (от новой к старой)
-            for DOWNLOAD_URL in "${URLS[@]}"; do
-              echo "Attempting to download version: $DOWNLOAD_URL"
-              
-              if curl -f -L -o core_archive "$DOWNLOAD_URL"; then
-                # Проверка: файл не пустой
-                if [ -s core_archive ]; then
-                  echo "Download successful. Extracting..."
-                  
-                  # Распаковка (универсальная)
-                  if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
-                    tar -xvf core_archive || continue
-                  else
-                    gunzip -c core_archive > lite-speedtest || continue
-                  fi
-                  
-                  # Поиск и подготовка бинарника
-                  find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
-                  chmod +x ./lite-speedtest
-                  
-                  # Тестовый запуск для проверки "живости" бинарника
-                  if ./lite-speedtest -v > /dev/null 2>&1 || [ -x "./lite-speedtest" ]; then
-                    echo "CORE VALIDATED: This version works!"
-                    SUCCESS=true
-                    break
-                  else
-                    echo "Validation failed for this version. Trying older one..."
-                  fi
-                fi
-              else
-                echo "Download failed for this specific URL. Trying next..."
-              fi
-            done
           done
 
-          # ШАНС 2: Если API вообще не ответило (Rate Limit), используем прямые проверенные ссылки
+          # 2. Если прямые ссылки подвели (например, автор сменил имя файла), пробуем API (Step 2)
           if [ "$SUCCESS" = false ]; then
-            echo "-----------------------------------------------"
-            echo "Deep Search failed. Trying hardcoded direct fallbacks..."
-            DIRECT_URLS=(
-              "https://github.com/StairS/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.tar.gz"
-              "https://github.com/StairS/lite-speedtest/releases/download/v0.18.0/lite-speedtest-linux-amd64.tar.gz"
-              "https://github.com/xxf002/lite-speedtest/releases/download/v0.17.1/lite-speedtest-linux-amd64.tar.gz"
-            )
+            echo "Step 2: Direct links failed. Falling back to Deep API Search..."
+            REPOS=("StairS/lite-speedtest" "xxf002/lite-speedtest" "Yidadaa/v2ray-speedtest")
+            
+            for REPO in "${REPOS[@]}"; do
+              if [ "$SUCCESS" = true ]; then break; fi
+              API_URL="https://api.github.com/repos/$REPO/releases?per_page=3"
+              RESPONSE=$(curl -sSL $API_URL)
+              
+              if echo "$RESPONSE" | jq -e '.message' > /dev/null; then continue; fi
 
-            for DURL in "${DIRECT_URLS[@]}"; do
-              echo "Trying direct URL: $DURL"
-              if curl -f -L -o core_archive "$DURL"; then
-                tar -xvf core_archive || gunzip -c core_archive > lite-speedtest
-                find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
-                chmod +x ./lite-speedtest
-                if [ -x "./lite-speedtest" ]; then
+              mapfile -t URLS < <(echo "$RESPONSE" | jq -r '.[].assets[]? | select(.name | contains("linux") and contains("amd64")) | .browser_download_url')
+              
+              for AURL in "${URLS[@]}"; do
+                if curl -f -L -o core_archive "$AURL"; then
                   SUCCESS=true
-                  break
+                  DOWNLOAD_URL=$AURL
+                  break 2
                 fi
-              fi
+              done
             done
           fi
 
-          if [ "$SUCCESS" = false ]; then
-            echo "CRITICAL ERROR: Could not find any working core version!"
+          # 3. Обработка скачанного файла
+          if [ "$SUCCESS" = true ]; then
+            echo "Processing downloaded archive..."
+            
+            # Универсальная распаковка на основе расширения или контента
+            if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
+              tar -xvf core_archive || gunzip -c core_archive > lite-speedtest
+            else
+              gunzip -c core_archive > lite-speedtest || tar -xvf core_archive
+            fi
+            
+            # Находим бинарник, как бы он ни назывался (но не архив)
+            find . -maxdepth 2 -type f -executable -not -name "*.gz" -not -name "*.tar*" -not -name "*.py" -not -name "*.sh" -exec mv {} ./lite-speedtest \;
+            chmod +x ./lite-speedtest
+            
+            if [ -x "./lite-speedtest" ]; then
+              echo "CORE READY: $(./lite-speedtest -v 2>&1 | head -n 1 || echo 'Executable validated')"
+            else
+              echo "Error: Extraction failed to produce a binary."
+              exit 1
+            fi
+          else
+            echo "CRITICAL ERROR: No working source found (Direct or API)!"
             exit 1
           fi
 
@@ -127,5 +104,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "Elite-Inspector-Bot"
           git add .
-          git commit -m "Deep Audit Complete (Smart Versioning): $(date)" || exit 0
+          git commit -m "Deep Audit Complete (Robust Core Fetching): $(date)" || exit 0
           git push
