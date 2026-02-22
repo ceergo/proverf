@@ -23,48 +23,68 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Smart & Secure Download Core (StairS)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # 1. Поиск самого свежего релиза бинарного ядра для тестов скорости
           REPO="StairS/lite-speedtest"
           API_URL="https://api.github.com/repos/$REPO/releases/latest"
           
           echo "Fetching metadata for latest release of $REPO..."
-          DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
           
+          # Запрашиваем данные с токеном, чтобы избежать лимитов
+          RESPONSE=$(curl -s -H "Authorization: token $GH_TOKEN" $API_URL)
+          
+          # Проверяем, не пустой ли ответ
+          if [ -z "$RESPONSE" ] || [ "$RESPONSE" == "null" ]; then
+            echo "Error: GitHub API returned empty response!"
+            exit 1
+          fi
+
+          # Извлекаем URL для скачивания (linux amd64)
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.assets[]? | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
+          
+          # Если в latest нет активов, пробуем расширенный поиск по всем релизам
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            echo "Error: Could not find a valid binary!"
+            echo "Latest release assets not found, searching in general releases..."
+            API_URL_ALL="https://api.github.com/repos/$REPO/releases"
+            DOWNLOAD_URL=$(curl -s -H "Authorization: token $GH_TOKEN" $API_URL_ALL | jq -r '.[0].assets[]? | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
+          fi
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            echo "Critical Error: Could not find a valid binary link in GitHub Releases!"
+            echo "API Response Snippet: $(echo "$RESPONSE" | head -c 200)..."
             exit 1
           fi
           
+          echo "Found binary at: $DOWNLOAD_URL"
           curl -L -o core_archive "$DOWNLOAD_URL"
           
           # --- УМНАЯ ПРОВЕРКА БЕЗОПАСНОСТИ (КОРИДОР ВЕСА) ---
           FILE_SIZE=$(stat -c%s "core_archive")
-          MIN_SIZE=3145728  # 3 MB (Минимальный порог для скомпилированного Go-бинарника)
-          MAX_SIZE=52428800 # 50 MB (Максимальный порог)
+          MIN_SIZE=3145728  # 3 MB 
+          MAX_SIZE=52428800 # 50 MB 
           
           echo "Downloaded file size: $FILE_SIZE bytes"
 
           if [ "$FILE_SIZE" -lt "$MIN_SIZE" ]; then
-            echo "Security Alert: File is too small ($FILE_SIZE bytes). Expected > 3MB."
+            echo "Security Alert: File is too small ($FILE_SIZE bytes)."
             exit 1
           fi
           
           if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
-            echo "Security Alert: File is too large ($FILE_SIZE bytes). Expected < 50MB."
+            echo "Security Alert: File is too large ($FILE_SIZE bytes)."
             exit 1
           fi
 
-          # Сравнение с предыдущим весом для детекта аномальных обновлений
+          # Сравнение с предыдущим весом
           if [ -f "last_core_size.txt" ]; then
             PREV_SIZE=$(cat last_core_size.txt)
             DIFF=$((FILE_SIZE - PREV_SIZE))
             ABS_DIFF=${DIFF#-} 
-            
             THRESHOLD=$((PREV_SIZE / 2))
             if [ "$ABS_DIFF" -gt "$THRESHOLD" ]; then
-              echo "Warning: File size changed significantly (more than 50% difference)!"
-              echo "Previous: $PREV_SIZE, Current: $FILE_SIZE"
+              echo "Warning: File size changed significantly!"
             fi
           fi
           
@@ -78,7 +98,7 @@ jobs:
             gunzip -c core_archive > lite-speedtest
           fi
           
-          # 3. Приведение к стандартному имени для вызова из Python
+          # 3. Приведение к стандартному имени
           find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
           chmod +x lite-speedtest
           
