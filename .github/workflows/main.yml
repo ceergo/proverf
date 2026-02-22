@@ -1,66 +1,39 @@
 name: Elite Proxy Factory
 
 on:
-  schedule:
-    - cron: '0 * * * *'    # Раз в час (инкрементально - только новые)
-    - cron: '0 */6 * * *'  # Раз в 6 часов (полная чистка всей базы)
-  workflow_dispatch:        # Ручной запуск кнопкой
-    inputs:
-      full_audit:
-        description: 'Run Full Audit? (Check everything)'
-        required: false
-        default: 'false'
-        type: boolean
+  schedule:
+    - cron: '0 * * * *'
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      full_audit:
+        description: 'Full Audit?'
+        type: boolean
+        default: false
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    # Даем права на запись, чтобы бот мог обновлять файлы подписок
-    permissions:
-      contents: write
-      
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Cache Xray Binary
-        id: cache-xray
-        uses: actions/cache@v3
-        with:
-          path: ./xray
-          key: ${{ runner.os }}-xray-v1.8.4
-
-      - name: Download Xray if not cached
-        if: steps.cache-xray.outputs.cache-hit != 'true'
-        run: |
-          wget https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip
-          unzip Xray-linux-64.zip xray
-          chmod +x xray
-
-      - name: Install Dependencies
-        run: pip install requests
-
-      - name: Run Proxy Factory
-        run: |
-          # Если запуск по расписанию раз в 6 часов или нажат флаг Full Audit
-          if [[ "${{ github.event.schedule }}" == "0 */6 * * *" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
-            echo "Running FULL AUDIT..."
-            python main.py --full
-          else
-            echo "Running INCREMENTAL update..."
-            python main.py
-          fi
-
-      - name: Commit and Push Results
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action Bot"
-          # Добавляем все текстовые файлы и base64 подписки
-          git add sub_*.txt base64_*.txt || true
-          git commit -m "🚀 Auto-update: Elite Subscriptions [skip ci]" || exit 0
-          git push
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install
+        run: pip install requests
+      - name: Run
+        run: |
+          if [ "${{ github.event.inputs.full_audit }}" == "true" ]; then
+            python main.py --full
+          else
+            python main.py
+          fi
+      - name: Push
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add .
+          git commit -m "Update" || exit 0
+          git push
