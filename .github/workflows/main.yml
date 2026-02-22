@@ -22,77 +22,69 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Ultimate Robust Core Download
+      - name: Restore Stable Legacy Core
         run: |
           SUCCESS=false
 
-          # 1. Сначала пробуем "Умные" прямые ссылки (не зависят от API и Rate Limits)
-          # Это формат, который GitHub всегда редиректит на актуальную версию
-          DIRECT_URLS=(
-            "https://github.com/StairS/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.tar.gz"
-            "https://github.com/xxf002/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.gz"
-            "https://github.com/StairS/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.gz"
-            "https://github.com/xxf002/lite-speedtest/releases/latest/download/lite-speedtest-linux-amd64.tar.gz"
+          # Список "Золотого фонда" - проверенные стабильные версии (2-3 месяца назад)
+          # Используем прямые ссылки на конкретные теги, которые обычно не удаляют
+          STABLE_URLS=(
+            "https://github.com/StairS/lite-speedtest/releases/download/v0.17.1/lite-speedtest-linux-amd64.tar.gz"
+            "https://github.com/xxf002/lite-speedtest/releases/download/v0.16.0/lite-speedtest-linux-amd64.gz"
+            "https://github.com/StairS/lite-speedtest/releases/download/v0.17.0/lite-speedtest-linux-amd64.tar.gz"
+            "https://github.com/xxf002/lite-speedtest/releases/download/v0.15.0/lite-speedtest-linux-amd64.gz"
           )
 
-          echo "Step 1: Trying Direct 'Latest' Downloads (Bypassing API)..."
-          for DURL in "${DIRECT_URLS[@]}"; do
-            echo "Checking: $DURL"
-            if curl -f -L -o core_archive "$DURL"; then
-              echo "Success! Downloaded from direct link."
+          echo "Step 1: Attempting to restore stable legacy versions..."
+          for SURL in "${STABLE_URLS[@]}"; do
+            echo "Trying to recover: $SURL"
+            # Используем -I для проверки существования перед качанием (чтобы не ждать 404)
+            if curl -sfL -o core_archive "$SURL"; then
+              echo "Success! Stable core recovered from $SURL"
               SUCCESS=true
-              DOWNLOAD_URL=$DURL
+              DOWNLOAD_URL=$SURL
               break
             fi
           done
 
-          # 2. Если прямые ссылки подвели (например, автор сменил имя файла), пробуем API (Step 2)
+          # Step 2: Если старые версии удалены, пробуем аварийный поиск в API
           if [ "$SUCCESS" = false ]; then
-            echo "Step 2: Direct links failed. Falling back to Deep API Search..."
-            REPOS=("StairS/lite-speedtest" "xxf002/lite-speedtest" "Yidadaa/v2ray-speedtest")
-            
+            echo "Step 2: Legacy links failed. Trying to find any working version via API..."
+            REPOS=("StairS/lite-speedtest" "xxf002/lite-speedtest")
             for REPO in "${REPOS[@]}"; do
               if [ "$SUCCESS" = true ]; then break; fi
-              API_URL="https://api.github.com/repos/$REPO/releases?per_page=3"
-              RESPONSE=$(curl -sSL $API_URL)
-              
-              if echo "$RESPONSE" | jq -e '.message' > /dev/null; then continue; fi
-
-              mapfile -t URLS < <(echo "$RESPONSE" | jq -r '.[].assets[]? | select(.name | contains("linux") and contains("amd64")) | .browser_download_url')
-              
-              for AURL in "${URLS[@]}"; do
+              RESPONSE=$(curl -sSL https://api.github.com/repos/$REPO/releases)
+              AURL=$(echo "$RESPONSE" | jq -r '.[].assets[]? | select(.name | contains("linux") and contains("amd64")) | .browser_download_url' | head -n 1)
+              if [ -n "$AURL" ] && [ "$AURL" != "null" ]; then
                 if curl -f -L -o core_archive "$AURL"; then
                   SUCCESS=true
                   DOWNLOAD_URL=$AURL
-                  break 2
+                  break
                 fi
-              done
+              fi
             done
           fi
 
-          # 3. Обработка скачанного файла
           if [ "$SUCCESS" = true ]; then
-            echo "Processing downloaded archive..."
-            
-            # Универсальная распаковка на основе расширения или контента
+            echo "Extracting and validating core..."
             if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
               tar -xvf core_archive || gunzip -c core_archive > lite-speedtest
             else
               gunzip -c core_archive > lite-speedtest || tar -xvf core_archive
             fi
             
-            # Находим бинарник, как бы он ни назывался (но не архив)
+            # Универсальный поиск бинарника
             find . -maxdepth 2 -type f -executable -not -name "*.gz" -not -name "*.tar*" -not -name "*.py" -not -name "*.sh" -exec mv {} ./lite-speedtest \;
             chmod +x ./lite-speedtest
             
             if [ -x "./lite-speedtest" ]; then
-              echo "CORE READY: $(./lite-speedtest -v 2>&1 | head -n 1 || echo 'Executable validated')"
+              echo "CORE RESTORED: $(./lite-speedtest -v 2>&1 | head -n 1 || echo 'Binary ready')"
             else
-              echo "Error: Extraction failed to produce a binary."
+              echo "Error: Extraction failed."
               exit 1
             fi
           else
-            echo "CRITICAL ERROR: No working source found (Direct or API)!"
+            echo "CRITICAL ERROR: All stable versions and API fallbacks failed!"
             exit 1
           fi
 
@@ -104,5 +96,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "Elite-Inspector-Bot"
           git add .
-          git commit -m "Deep Audit Complete (Robust Core Fetching): $(date)" || exit 0
+          git commit -m "Deep Audit Complete (Legacy Stable Core): $(date)" || exit 0
           git push
