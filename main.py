@@ -4,51 +4,46 @@ import subprocess
 import hashlib
 import time
 import asyncio
+import re
 from datetime import datetime, timedelta
 
-# --- CONFIGURATION (Boss, do not touch these paths) ---
+# --- CONFIGURATION ---
 RAW_LINKS_FILE = "raw_links.txt"
 DEAD_CACHE_FILE = "dead_cache.txt"
 CLEANUP_LOG = "last_cleanup.txt"
 
 # Output files
-ELITE_GEMINI = "Elite_Gemini.txt"     # Full access + High Speed
-STABLE_CHAT = "Stable_Chat.txt"      # Working Gemini + Normal Speed
-FAST_NO_GOOGLE = "Fast_NoGoogle.txt" # High Speed, but Google is blocked
+ELITE_GEMINI = "Elite_Gemini.txt"
+STABLE_CHAT = "Stable_Chat.txt"
+FAST_NO_GOOGLE = "Fast_NoGoogle.txt"
 
 RESULT_FILES = [ELITE_GEMINI, STABLE_CHAT, FAST_NO_GOOGLE]
 
-# Verification Rules (The "Anchors")
+# Verification Rules
 CHECK_RULES = [
     {
         "name": "AI_STUDIO",
         "url": "https://aistudio.google.com/",
         "must_not_contain": ["ai.google.dev", "available-regions"],
-        "weight": "high"
     },
     {
         "name": "SPOTIFY",
         "url": "https://open.spotify.com/",
         "must_not_contain": ["why-not-available"],
-        "weight": "medium"
     }
 ]
 
 MAIN_GEMINI_APP = "https://gemini.google.com/app"
 SPEED_TEST_URL = "https://cachefly.cachefly.net/1mb.test" 
 
-# Concurrency Management
 MAX_CONCURRENT_PROXIES = 100 
 
 def get_md5(text):
-    """Generates a stable MD5 hash for unique proxy identification."""
     return hashlib.md5(text.encode()).hexdigest()
 
 def remove_proxy_from_all_files(proxy_link):
-    """Ensures a proxy doesn't exist in any output file before re-categorizing or banning."""
     for file_path in RESULT_FILES:
-        if not os.path.exists(file_path):
-            continue
+        if not os.path.exists(file_path): continue
         try:
             with open(file_path, "r") as f:
                 lines = f.readlines()
@@ -56,49 +51,81 @@ def remove_proxy_from_all_files(proxy_link):
             if len(lines) != len(new_lines):
                 with open(file_path, "w") as f:
                     f.writelines(new_lines)
-        except Exception as e:
-            pass # Silent error to maintain loop stability
+        except: pass
 
 def manage_cache_lifecycle():
-    """Wipes dead cache and fresh results every 72 hours based on last_cleanup timestamp."""
     now = datetime.now()
     if os.path.exists(CLEANUP_LOG):
         with open(CLEANUP_LOG, "r") as f:
             try:
                 last_run = datetime.fromisoformat(f.read().strip())
                 if now - last_run > timedelta(hours=72):
-                    print(f"[{now.strftime('%H:%M:%S')}] [CLEANUP] 72h limit reached. Cleaning database...")
+                    print(f"[{now.strftime('%H:%M:%S')}] [CLEANUP] 72h reached. Wiping old data...")
                     if os.path.exists(DEAD_CACHE_FILE): os.remove(DEAD_CACHE_FILE)
                     for f_name in RESULT_FILES:
                         if os.path.exists(f_name): open(f_name, 'w').close()
                     with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
-            except:
-                with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
+            except: pass
     else:
         with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
 
-def load_and_filter_input():
-    """Loads proxies from raw_links.txt and skips those already in dead_cache."""
+def extract_configs_from_text(text):
+    """
+    Parses raw text to find proxy-like strings (vmess, vless, ss, trojan, etc.)
+    """
+    # Regex for common proxy protocols
+    pattern = r'(vless|vmess|ss|trojan|ssr)://[^\s|#]+'
+    found = re.findall(pattern, text, re.IGNORECASE)
+    return list(set(found))
+
+async def load_and_expand_links():
+    """
+    Reads raw_links.txt, follows URLs if needed, and extracts individual configs.
+    """
     if not os.path.exists(RAW_LINKS_FILE):
-        print(f"[ERROR] {RAW_LINKS_FILE} not found!")
+        print(f"[ERROR] {RAW_LINKS_FILE} missing!")
         return []
-    with open(RAW_LINKS_FILE, "r") as f:
-        links = list(set(line.strip() for line in f if line.strip()))
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [PARSER] Reading {RAW_LINKS_FILE}...")
     
+    with open(RAW_LINKS_FILE, "r") as f:
+        raw_lines = [line.strip() for line in f if line.strip()]
+
+    all_configs = []
+    
+    for entry in raw_lines:
+        if entry.startswith("http"):
+            print(f"  > [FETCHING] {entry} ...")
+            try:
+                # Use curl to fetch the subscription content
+                cmd = ["curl", "-s", "-L", "-m", "15", entry]
+                proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, _ = await proc.communicate()
+                content = stdout.decode(errors='ignore')
+                
+                configs = extract_configs_from_text(content)
+                print(f"    - Found {len(configs)} configs in this URL.")
+                all_configs.extend(configs)
+            except Exception as e:
+                print(f"    - [ERROR] Failed to fetch {entry}: {e}")
+        else:
+            # It's a direct config line
+            all_configs.append(entry)
+
+    # Filtering through dead cache
     dead_ids = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             dead_ids = set(line.strip() for line in f)
-            
-    filtered = [l for l in links if get_md5(l) not in dead_ids]
-    print(f"--- [LOADER] ---")
-    print(f"Total links: {len(links)}")
-    print(f"Ignored (Banned): {len(links) - len(filtered)}")
-    print(f"Active queue: {len(filtered)}")
-    return filtered
+
+    unique_configs = list(set(all_configs))
+    final_list = [c for c in unique_configs if get_md5(c) not in dead_ids]
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [PARSER] Total unique: {len(unique_configs)} | Active: {len(final_list)} (Banned: {len(unique_configs)-len(final_list)})")
+    return final_list
 
 async def check_url_anchor(link, rule):
-    """Executes curl with redirect tracking and logs final destination URL."""
+    start = time.time()
     try:
         cmd = [
             "curl", "-s", "-L", "--proxy", link, rule["url"],
@@ -106,144 +133,107 @@ async def check_url_anchor(link, rule):
             "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "-w", "%{url_effective}"
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         final_url = stdout.decode(errors='ignore').strip().lower()
+        latency = round((time.time() - start) * 1000, 0)
         
         if not final_url or len(final_url) < 5: 
-            return {"name": rule["name"], "status": "FAIL", "final_url": "NO_RESPONSE"}
+            return {"status": "FAIL", "url": "TIMEOUT", "ms": latency}
         
-        # Checking for forbidden patterns in final URL
-        is_blocked = any(marker in final_url for marker in rule["must_not_contain"])
-        return {
-            "name": rule["name"], 
-            "status": "BLOCK" if is_blocked else "OK", 
-            "final_url": final_url
-        }
+        is_blocked = any(marker in final_url for marker in rule.get("must_not_contain", []))
+        return {"status": "BLOCK" if is_blocked else "OK", "url": final_url, "ms": latency}
     except:
-        return {"name": rule["name"], "status": "FAIL", "final_url": "SYSTEM_ERROR"}
+        return {"status": "FAIL", "url": "ERROR", "ms": 0}
 
 async def measure_speed(link):
-    """Measures raw download speed for 1MB file."""
+    start = time.time()
     try:
-        start_time = time.time()
         cmd = [
             "curl", "-L", "--proxy", link, SPEED_TEST_URL,
             "-o", "/dev/null", "-s", "--max-time", "12", "-w", "%{http_code}"
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
-        end_time = time.time()
+        duration = time.time() - start
         
         if stdout.decode().strip() == "200":
-            duration = end_time - start_time
-            # 8 bits per byte -> Mbps calculation
-            return round(8 / duration, 2) if duration > 0 else 0
+            return round(8 / duration, 2)
         return 0
-    except:
-        return 0
+    except: return 0
 
 async def async_headless_audit(link):
     """
-    Core Logic: Step-by-step trace of proxy performance.
-    Outputs detailed logs for real-time monitoring.
+    Real-time detailed trace of each proxy's journey.
     """
     trace = []
     
-    # 1. Speed Test
+    # Speed check
     speed = await measure_speed(link)
     trace.append(f"SPEED: {speed} Mbps")
     
-    # 2. Burst Anchors (Parallel)
-    burst_tasks = [check_url_anchor(link, rule) for rule in CHECK_RULES]
-    burst_results = await asyncio.gather(*burst_tasks)
+    # Burst Anchors
+    tasks = [check_url_anchor(link, rule) for rule in CHECK_RULES]
+    results = await asyncio.gather(*tasks)
     
-    # Extract results for logic
-    ai_studio_res = next((r for r in burst_results if r["name"] == "AI_STUDIO"), None)
-    spotify_res = next((r for r in burst_results if r["name"] == "SPOTIFY"), None)
+    ai_studio = results[0]
+    spotify = results[1]
     
-    ai_studio_ok = ai_studio_res["status"] == "OK" if ai_studio_res else False
-    any_block = any(r["status"] == "BLOCK" for r in burst_results)
-    all_failed = all(r["status"] == "FAIL" for r in burst_results)
+    trace.append(f"AI_STUDIO: {ai_studio['status']} ({ai_studio['ms']}ms) -> {ai_studio['url']}")
+    trace.append(f"SPOTIFY: {spotify['status']} ({spotify['ms']}ms) -> {spotify['url']}")
 
-    trace.append(f"ANCHOR AI_STUDIO: {ai_studio_res['status']} -> {ai_studio_res['final_url']}")
-    trace.append(f"ANCHOR SPOTIFY: {spotify_res['status']} -> {spotify_res['final_url']}")
+    # Gemini Validation
+    gemini_res = await check_url_anchor(link, {"url": MAIN_GEMINI_APP, "must_not_contain": ["unsupported"]})
+    gemini_ok = (gemini_res["status"] == "OK" and "/app" in gemini_res["url"])
+    trace.append(f"GEMINI_APP: {'SUCCESS' if gemini_ok else 'FAILED'} ({gemini_res['ms']}ms) -> {gemini_res['url']}")
 
-    # 3. Gemini App Validation (Final Path /app check)
-    res_gemini = await check_url_anchor(link, {"url": MAIN_GEMINI_APP, "must_not_contain": ["unsupported"], "name": "GEMINI_APP"})
-    gemini_app_working = (res_gemini["status"] == "OK" and "/app" in res_gemini.get("final_url", ""))
-    
-    trace.append(f"GEMINI_APP_AUTH: {'SUCCESS' if gemini_app_working else 'FAILED'} -> {res_gemini['final_url']}")
-
-    # --- DECISION ENGINE ---
-    decision = "DEAD"
-    
-    # Priority 1: Elite (Full Access + Speed)
-    if gemini_app_working and ai_studio_ok and not any_block and speed >= 15:
-        decision = "ELITE"
-    # Priority 2: Stable (Functional Gemini)
-    elif gemini_app_working and speed >= 0.5:
-        decision = "STABLE"
-    # Priority 3: Fast No Google (Just fast pipe)
+    # Decision logic
+    category = "DEAD"
+    if gemini_ok and ai_studio['status'] == "OK" and speed >= 15:
+        category = "ELITE"
+    elif gemini_ok and speed >= 0.5:
+        category = "STABLE"
     elif speed >= 15:
-        decision = "FAST_NO_GOOGLE"
-    
-    # Print Trace to Console for Boss
-    print(f"--- [AUDIT START] {link} ---")
-    for step in trace:
-        print(f"  {step}")
-    print(f"  [>>>] FINAL CATEGORY: {decision}\n")
+        category = "FAST_NO_GOOGLE"
 
-    return link, decision, speed
+    # Real-time console report
+    print(f"--- [PROBING] {link[:50]}... ---")
+    for step in trace: print(f"  [>] {step}")
+    print(f"  [!!!] RESULT: {category}\n")
+
+    return link, category, speed
 
 async def main_orchestrator():
-    """Manages the lifecycle of the Sieve audit."""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] --- INITIATING SIERRA MASTER AUDIT ---")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] --- STARTING REAL-TIME SIERRA AUDIT ---")
     
     manage_cache_lifecycle()
-    links = load_and_filter_input()
+    # Step 1: Expand subscriptions and raw configs
+    links = await load_and_expand_links()
     total = len(links)
     
     if total == 0:
-        print("No work to do. Exiting.")
+        print("No configs found to check.")
         return
 
-    # Processing in concurrent chunks
+    # Process chunks
     for i in range(0, total, MAX_CONCURRENT_PROXIES):
         chunk = links[i : i + MAX_CONCURRENT_PROXIES]
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing Batch {i//MAX_CONCURRENT_PROXIES + 1}...")
+        print(f"--- Processing Batch {i//MAX_CONCURRENT_PROXIES + 1} ({len(chunk)} nodes) ---")
         
         tasks = [async_headless_audit(link) for link in chunk]
         results = await asyncio.gather(*tasks)
         
-        for link, category, speed in results:
-            if category == "DEAD":
-                # Permanent Ban for this cycle
-                with open(DEAD_CACHE_FILE, "a") as f: 
-                    f.write(get_md5(link) + "\n")
+        for link, cat, speed in results:
+            if cat == "DEAD":
+                with open(DEAD_CACHE_FILE, "a") as f: f.write(get_md5(link) + "\n")
                 remove_proxy_from_all_files(link)
-                continue
-                
-            target_file = {
-                "ELITE": ELITE_GEMINI,
-                "STABLE": STABLE_CHAT,
-                "FAST_NO_GOOGLE": FAST_NO_GOOGLE
-            }.get(category)
-
-            if target_file:
-                # Clean up existing entry before adding updated one
+            else:
+                target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
                 remove_proxy_from_all_files(link)
-                with open(target_file, "a") as f:
-                    f.write(f"{link} # [{category}] {speed}Mbps | Date: {datetime.now().strftime('%d.%m %H:%M')}\n")
+                with open(target, "a") as f:
+                    f.write(f"{link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%H:%M')}\n")
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] --- MASTER AUDIT COMPLETE ---")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] --- AUDIT COMPLETE ---")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_orchestrator())
-    except KeyboardInterrupt:
-        print("\nAudit interrupted by Boss.")
+    asyncio.run(main_orchestrator())
