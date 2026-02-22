@@ -22,57 +22,21 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Download LiteSpeedTest Core (Smart Search)
+      - name: Download Modern LiteSpeedTest Core
         run: |
-          # 1. Запрашиваем данные о последнем релизе у официального форка
-          REPO="Yidadaa/v2ray-speedtest"
-          API_URL="https://api.github.com/repos/$REPO/releases/latest"
+          # Используем стабильное современное ядро v0.17.1
+          wget -O core.tar.gz https://github.com/xxf002/lite-speedtest/releases/download/v0.17.1/lite-speedtest-linux-amd64.tar.gz
+          tar -xvf core.tar.gz
           
-          echo "Fetching metadata from $API_URL..."
-          
-          # 2. Находим прямую ссылку на linux-amd64 через jq
-          DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("linux-amd64")) | .browser_download_url' | head -n 1)
-          
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            echo "Error: Could not find a linux-amd64 asset in the latest release!"
-            exit 1
-          fi
-          
-          FILE_NAME=$(basename "$DOWNLOAD_URL")
-          echo "Found asset: $FILE_NAME"
-          echo "Download URL: $DOWNLOAD_URL"
-          
-          # 3. Скачиваем файл
-          curl -L -o "$FILE_NAME" "$DOWNLOAD_URL"
-          
-          # 4. Умная распаковка в зависимости от расширения
-          if [[ "$FILE_NAME" == *.tar.gz ]]; then
-            echo "Detected tar.gz format..."
-            tar -xvf "$FILE_NAME"
-          elif [[ "$FILE_NAME" == *.gz ]]; then
-            echo "Detected .gz format..."
-            gunzip -c "$FILE_NAME" > lite-speedtest
-          elif [[ "$FILE_NAME" == *.zip ]]; then
-            echo "Detected .zip format..."
-            unzip "$FILE_NAME"
-          else
-            echo "Detected raw binary format..."
-            mv "$FILE_NAME" lite-speedtest
-          fi
-          
-          # 5. Финальный поиск бинарника (если он оказался в папке после распаковки)
-          # Ищем файл, начинающийся на 'lite-speedtest' и являющийся исполняемым
-          find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar.gz" -exec mv {} ./lite-speedtest \;
+          # Находим бинарник и переименовываем его для нашего скрипта
+          find . -name "lite-speedtest*" -type f -not -name "*.tar.gz" -exec mv {} ./lite-speedtest \;
           chmod +x lite-speedtest
           
-          # Проверка результата
           if [ ! -f "lite-speedtest" ]; then
-            echo "Critical Error: Binary 'lite-speedtest' not found after processing!"
-            ls -R
+            echo "Critical Error: Binary not found after extraction!"
             exit 1
           fi
-          
-          echo "Success: Binary is ready. Size: $(stat -c%s lite-speedtest) bytes."
+          echo "Modern Core v0.17.1 is ready."
 
       - name: Run Sieve Orchestrator
         run: python main.py
@@ -82,5 +46,6 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "Elite-Inspector-Bot"
           git add .
-          git commit -m "Deep Audit Complete: $(date)" || exit 0
+          # Committing results only if changes exist
+          git commit -m "Deep Audit Complete (Modern Core): $(date)" || exit 0
           git push
