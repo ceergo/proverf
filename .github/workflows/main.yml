@@ -1,5 +1,4 @@
 name: Elite Proxy Factory
-
 on:
   schedule:
     - cron: '0 * * * *'    # Раз в час (инкрементально - только новые)
