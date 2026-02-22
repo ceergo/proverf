@@ -20,13 +20,11 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Устанавливаем необходимые библиотеки из requirements.txt
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Sieve Orchestrator
         run: python main.py
         env:
-          # Передаем токен на случай, если в будущем понадобятся запросы к API из скрипта
           GH_TOKEN: ${{ github.token }}
 
       - name: Commit and Push Results
@@ -34,6 +32,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "Elite-Inspector-Bot"
           git add .
-          # Коммитим изменения только если они есть
-          git commit -m "Deep Audit Complete (Native Sieve Mode): $(date)" || exit 0
-          git push
+          # Коммитим только при наличии изменений (предотвращает ошибку пустого коммита)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Deep Audit Complete (Native Sieve Mode): $(date)" && git push)
