@@ -62,5 +62,5 @@ jobs:
           git config --local user.name "GitHub Action Bot"
           # Добавляем все текстовые файлы и base64 подписки
           git add sub_*.txt base64_*.txt || true
-          git commit -m "🚀 Auto-update: Elite Subscriptions [skip ci]" || exit 0
+          git commit -m " Auto-update: Elite Subscriptions [skip ci]" || exit 0
           git push
