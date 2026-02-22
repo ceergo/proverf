@@ -1,10 +1,11 @@
 {
-    "total_loaded": 2,
+    "input_count": 2,
+    "tcp_alive": 0,
+    "google_ok": 0,
     "elite": 0,
-    "fast": 0,
-    "cis": 0,
-    "brave": 0,
+    "gemini": 0,
+    "kz": 0,
+    "by": 0,
     "dead": 0,
-    "last_update": "2026-02-22 15:45:10",
-    "system_restarts": 0
+    "start_time": "2026-02-22T16:38:23.849362"
 }
