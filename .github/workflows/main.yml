@@ -1,100 +1,148 @@
-name: Proxy Multi-Sieve Inspector (Triggered)
+import os
+import json
+import subprocess
+import hashlib
+import time
+from datetime import datetime, timedelta
 
-on:
-  repository_dispatch:
-    types: [proxy_updated]
-  workflow_dispatch:
+# --- CONFIGURATION ---
+RAW_LINKS_FILE = "raw_links.txt"
+DEAD_CACHE_FILE = "dead_cache.txt"
+CLEANUP_LOG = "last_cleanup.txt"
+CORE_BINARY = "./librespeed-cli"
 
-jobs:
-  sieve_process:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+# Категории вывода
+ELITE_FILE = "Elite_Gemini.txt"
+SPEED_FILE = "Speed_Master.txt"
+RESERVE_FILE = "Stable_Reserve.txt"
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+# Список надежных серверов LibreSpeed (Backend API)
+# Мы можем расширять этот список, не меняя ядро
+LIBRESPEED_SERVERS = [
+    "https://librespeed.org/backend-servers.php", # Авто-выбор ближайшего
+    "http://speedtest.tele2.net/backend/",        # Европа
+]
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+def get_md5(text):
+    """Генерирует стабильный ID для ссылки."""
+    return hashlib.md5(text.encode()).hexdigest()
 
-      - name: Restore Stable Legacy Core
-        run: |
-          SUCCESS=false
+def manage_cache_lifecycle():
+    """Чистит кэш раз в 72 часа."""
+    now = datetime.now()
+    if os.path.exists(CLEANUP_LOG):
+        with open(CLEANUP_LOG, "r") as f:
+            last_run = datetime.fromisoformat(f.read().strip())
+        if now - last_run > timedelta(hours=72):
+            if os.path.exists(DEAD_CACHE_FILE):
+                os.remove(DEAD_CACHE_FILE)
+            # Очищаем файлы результатов
+            for f in [ELITE_FILE, SPEED_FILE, RESERVE_FILE]:
+                if os.path.exists(f): open(f, 'w').close()
+            with open(CLEANUP_LOG, "w") as f:
+                f.write(now.isoformat())
+    else:
+        with open(CLEANUP_LOG, "w") as f:
+            f.write(now.isoformat())
 
-          # Список "Золотого фонда" - проверенные стабильные версии (2-3 месяца назад)
-          # Используем прямые ссылки на конкретные теги, которые обычно не удаляют
-          STABLE_URLS=(
-            "https://github.com/StairS/lite-speedtest/releases/download/v0.17.1/lite-speedtest-linux-amd64.tar.gz"
-            "https://github.com/xxf002/lite-speedtest/releases/download/v0.16.0/lite-speedtest-linux-amd64.gz"
-            "https://github.com/StairS/lite-speedtest/releases/download/v0.17.0/lite-speedtest-linux-amd64.tar.gz"
-            "https://github.com/xxf002/lite-speedtest/releases/download/v0.15.0/lite-speedtest-linux-amd64.gz"
-          )
-
-          echo "Step 1: Attempting to restore stable legacy versions..."
-          for SURL in "${STABLE_URLS[@]}"; do
-            echo "Trying to recover: $SURL"
-            # Используем -I для проверки существования перед качанием (чтобы не ждать 404)
-            if curl -sfL -o core_archive "$SURL"; then
-              echo "Success! Stable core recovered from $SURL"
-              SUCCESS=true
-              DOWNLOAD_URL=$SURL
-              break
-            fi
-          done
-
-          # Step 2: Если старые версии удалены, пробуем аварийный поиск в API
-          if [ "$SUCCESS" = false ]; then
-            echo "Step 2: Legacy links failed. Trying to find any working version via API..."
-            REPOS=("StairS/lite-speedtest" "xxf002/lite-speedtest")
-            for REPO in "${REPOS[@]}"; do
-              if [ "$SUCCESS" = true ]; then break; fi
-              RESPONSE=$(curl -sSL https://api.github.com/repos/$REPO/releases)
-              AURL=$(echo "$RESPONSE" | jq -r '.[].assets[]? | select(.name | contains("linux") and contains("amd64")) | .browser_download_url' | head -n 1)
-              if [ -n "$AURL" ] && [ "$AURL" != "null" ]; then
-                if curl -f -L -o core_archive "$AURL"; then
-                  SUCCESS=true
-                  DOWNLOAD_URL=$AURL
-                  break
-                fi
-              fi
-            done
-          fi
-
-          if [ "$SUCCESS" = true ]; then
-            echo "Extracting and validating core..."
-            if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
-              tar -xvf core_archive || gunzip -c core_archive > lite-speedtest
-            else
-              gunzip -c core_archive > lite-speedtest || tar -xvf core_archive
-            fi
+def load_and_filter_input():
+    """Загружает ссылки и фильтрует мертвые."""
+    if not os.path.exists(RAW_LINKS_FILE):
+        return []
+    
+    with open(RAW_LINKS_FILE, "r") as f:
+        links = list(set(line.strip() for line in f if line.strip()))
+    
+    dead_ids = set()
+    if os.path.exists(DEAD_CACHE_FILE):
+        with open(DEAD_CACHE_FILE, "r") as f:
+            dead_ids = set(line.strip() for line in f)
             
-            # Универсальный поиск бинарника
-            find . -maxdepth 2 -type f -executable -not -name "*.gz" -not -name "*.tar*" -not -name "*.py" -not -name "*.sh" -exec mv {} ./lite-speedtest \;
-            chmod +x ./lite-speedtest
+    return [l for l in links if get_md5(l) not in dead_ids]
+
+def execute_lite_benchmark(proxy_link):
+    """
+    Запускает librespeed-cli через прокси.
+    Использует переменную окружения all_proxy для туннелирования трафика.
+    """
+    try:
+        # Вызываем официальный librespeed-cli с флагом --json
+        # Мы ограничиваем время теста до 5 секунд для скорости
+        env = os.environ.copy()
+        env["all_proxy"] = proxy_link
+        env["http_proxy"] = proxy_link
+        env["https_proxy"] = proxy_link
+
+        process = subprocess.Popen(
+            [CORE_BINARY, "--json", "--duration", "5"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env
+        )
+        
+        stdout, stderr = process.communicate(timeout=35)
+        
+        if process.returncode != 0:
+            return None
+
+        # Ищем JSON в выводе (иногда там бывают лишние строки)
+        start_idx = stdout.find('{')
+        end_idx = stdout.rfind('}') + 1
+        if start_idx == -1 or end_idx == 0:
+            return None
             
-            if [ -x "./lite-speedtest" ]; then
-              echo "CORE RESTORED: $(./lite-speedtest -v 2>&1 | head -n 1 || echo 'Binary ready')"
-            else
-              echo "Error: Extraction failed."
-              exit 1
-            fi
-          else
-            echo "CRITICAL ERROR: All stable versions and API fallbacks failed!"
-            exit 1
-          fi
+        data = json.loads(stdout[start_idx:end_idx])
+        
+        # Парсим значения (LibreSpeed CLI обычно отдает Mbps или bps)
+        return {
+            "ping": data.get("ping", 0),
+            "download": data.get("download", 0), # Скорость в Mbps
+            "ip": data.get("client", {}).get("ip", "Unknown")
+        }
+    except Exception:
+        return None
 
-      - name: Run Sieve Orchestrator
-        run: python main.py
+def triple_tier_classifier(link, stats):
+    """Сортирует ноды по качеству на основе данных от LibreSpeed."""
+    if not stats or stats['ping'] == 0 or stats['ping'] > 350:
+        # Пинг выше 350 или ошибка теста — в кэш мертвых
+        with open(DEAD_CACHE_FILE, "a") as f:
+            f.write(get_md5(link) + "\n")
+        return
 
-      - name: Commit and Push Results
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "Elite-Inspector-Bot"
-          git add .
-          git commit -m "Deep Audit Complete (Legacy Stable Core): $(date)" || exit 0
-          git push
+    # Логика классификации по скорости (Mbps)
+    if stats['download'] > 50:
+        fname = ELITE_FILE
+    elif stats['download'] > 15:
+        fname = SPEED_FILE
+    else:
+        fname = RESERVE_FILE
+        
+    with open(fname, "a") as f:
+        f.write(f"{link} # [{datetime.now().strftime('%d/%m')}] Ping: {stats['ping']}ms, Speed: {stats['download']}Mbps, IP: {stats['ip']}\n")
+
+def main():
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Sieve Orchestrator: LibreSpeed Edition")
+    
+    # 1. Жизненный цикл кэша
+    manage_cache_lifecycle()
+    
+    # 2. Загрузка и фильтрация
+    links = load_and_filter_input()
+    print(f"Total links to check: {len(links)}")
+    
+    # 3. Основной цикл
+    for i, link in enumerate(links):
+        print(f"[{i+1}/{len(links)}] Testing: {link[:40]}...")
+        stats = execute_lite_benchmark(link)
+        
+        if stats:
+            print(f"   >>> Result: {stats['download']} Mbps | {stats['ping']} ms")
+        else:
+            print("   >>> Result: FAILED / TIMEOUT")
+            
+        triple_tier_classifier(link, stats)
+
+if __name__ == "__main__":
+    main()
