@@ -1,88 +1,41 @@
-name: Elite Proxy Factory
+name: Proxy Multi-Sieve Inspector (Triggered)
 
 on:
-  schedule:
-    # Runs at 27th minute of every 3rd hour
-    - cron: '27 */3 * * *'
-  push:
-    # Trigger immediately when you save personal links
-    paths:
-      - 'my_personal_links.txt'
-      - 'sub_raw.txt'
+  repository_dispatch:
+    types: [proxy_updated]
   workflow_dispatch:
-    inputs:
-      full_audit:
-        description: 'Perform deep L7 audit?'
-        required: false
-        default: 'false'
-        type: boolean
 
 jobs:
-  check-and-deploy:
+  sieve_process:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.10' # Рекомендую 3.10 для стабильности maxminddb
 
-      - name: Cache Xray Engine
-        id: cache-xray
-        uses: actions/cache@v3
-        with:
-          path: ./xray
-          key: ${{ runner.os }}-xray-v1.8.4
-
-      - name: Download Xray Core
-        if: steps.cache-xray.outputs.cache-hit != 'true'
+      - name: Install Dependencies
         run: |
-          wget https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip
-          unzip Xray-linux-64.zip xray
-          chmod +x xray
+          python -m pip install --upgrade pip
+          # Устанавливаем всё из файла, чтобы не забыть aiohttp
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Install dependencies
+      - name: Download LiteSpeedTest Core
         run: |
-          pip install requests maxminddb
+          wget https://github.com/SuS96/lite-speedtest-lib/releases/download/v0.15.0/lite-speedtest-linux-amd64.tar.gz
+          tar -xvf lite-speedtest-linux-amd64.tar.gz
+          chmod +x lite-speedtest
 
-      - name: 'Step 1: Execute Mega Worker (TCP & GeoIP)'
-        run: |
-          if [ -f "worker.py" ]; then
-            python worker.py
-          else
-            echo "worker.py not found, skipping Step 1"
-          fi
+      - name: Run Sieve Orchestrator
+        run: python main.py
 
-      - name: 'Step 2: Execute Deep Inspector (HTTP & Latency)'
+      - name: Commit and Push Results
         run: |
-          if [[ "${{ github.event_name }}" == "push" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
-            echo "RUNNING FULL AUDIT MODE..."
-            python main.py --full
-          else
-            echo "RUNNING STANDARD MODE..."
-            python main.py
-          fi
-
-      - name: Commit and Force Push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global user.name "EliteFactoryBot"
-          git config --global user.email "bot@github.com"
-          
-          # Безопасное добавление файлов: только если они существуют
-          for file in my_stable_configs.txt my_personal_links.txt activity_log.txt sub_elite.txt sub_fast.txt sub_cis.txt sub_brave.txt base64_elite.txt base64_fast.txt base64_cis.txt base64_brave.txt status.json; do
-            if [ -f "$file" ]; then
-              git add "$file"
-            fi
-          done
-          
-          # Force commit with pulse timestamp (даже если список файлов не изменился)
-          git commit -m "Auto-Pulse: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
-          
-          # Push to the main branch
-          git push origin main
+          git config --local user.email "action@github.com"
+          git config --local user.name "Elite-Inspector-Bot"
+          git add .
+          git commit -m "Deep Audit Complete: $(date)" || exit 0
+          git push
