@@ -2,18 +2,23 @@ name: Elite Proxy Factory
 
 on:
   schedule:
-    - cron: '0 * * * *'    # Раз в час (инкрементально)
-    - cron: '0 */6 * * *'  # Раз в 6 часов (полная чистка)
-  workflow_dispatch:        # Ручной запуск
+    - cron: '0 * * * *'    # Раз в час (инкрементально - только новые)
+    - cron: '0 */6 * * *'  # Раз в 6 часов (полная чистка всей базы)
+  workflow_dispatch:        # Ручной запуск кнопкой
     inputs:
       full_audit:
-        description: 'Run Full Audit?'
+        description: 'Run Full Audit? (Check everything)'
         required: false
         default: 'false'
+        type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Даем права на запись, чтобы бот мог обновлять файлы подписок
+    permissions:
+      contents: write
+      
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -42,16 +47,20 @@ jobs:
 
       - name: Run Proxy Factory
         run: |
+          # Если запуск по расписанию раз в 6 часов или нажат флаг Full Audit
           if [[ "${{ github.event.schedule }}" == "0 */6 * * *" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
+            echo "Running FULL AUDIT..."
             python main.py --full
           else
+            echo "Running INCREMENTAL update..."
             python main.py
           fi
 
       - name: Commit and Push Results
         run: |
           git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add sub_*.txt base64_*.txt
-          git commit -m "Update Elite Subscriptions [skip ci]" || exit 0
+          git config --local user.name "GitHub Action Bot"
+          # Добавляем все текстовые файлы и base64 подписки
+          git add sub_*.txt base64_*.txt || true
+          git commit -m "🚀 Auto-update: Elite Subscriptions [skip ci]" || exit 0
           git push
