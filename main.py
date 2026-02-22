@@ -127,8 +127,7 @@ class ProxyFactory:
         for target in CHECK_TARGETS:
             start = time.time()
             try:
-                # In a production environment, requests should be proxied via Xray SOCKS5
-                # Example: requests.get(target, proxies={'http': 'socks5h://127.0.0.1:port'}, ...)
+                # Note: In production use Xray as local socks5 proxy here
                 resp = requests.get(target, timeout=current_timeout, headers=headers)
                 if resp.status_code in [200, 204]:
                     results.append(int((time.time() - start) * 1000))
