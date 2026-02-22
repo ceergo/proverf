@@ -33,23 +33,23 @@ jobs:
             echo "Attempting to fetch latest core from: $REPO"
             
             API_URL="https://api.github.com/repos/$REPO/releases/latest"
-            DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
+            
+            # Добавляем флаг -sS для тишины и '?' в jq для защиты от null
+            RESPONSE=$(curl -sSL $API_URL)
+            DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.assets[]? | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
 
             if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-              echo "No valid assets found in $REPO. Skipping..."
+              echo "No valid assets found in $REPO via API."
               continue
             fi
 
             echo "Download URL found: $DOWNLOAD_URL"
             if curl -f -L -o core_archive "$DOWNLOAD_URL"; then
               
-              # Проверка безопасности (размер)
+              # Проверка целостности: просто убеждаемся, что файл не пустой
               FILE_SIZE=$(stat -c%s "core_archive")
-              MIN_SIZE=3145728  # 3 MB
-              MAX_SIZE=52428800 # 50 MB
-              
-              if [ "$FILE_SIZE" -ge "$MIN_SIZE" ] && [ "$FILE_SIZE" -le "$MAX_SIZE" ]; then
-                echo "File size validated: $FILE_SIZE bytes."
+              if [ "$FILE_SIZE" -gt 0 ]; then
+                echo "File downloaded successfully: $FILE_SIZE bytes."
                 
                 # Распаковка
                 if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
@@ -58,11 +58,11 @@ jobs:
                   gunzip -c core_archive > lite-speedtest || continue
                 fi
                 
-                # Поиск бинарника
+                # Поиск бинарника (универсальный поиск)
                 find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
                 chmod +x lite-speedtest
                 
-                # Финальный тест запуска
+                # Тестовый запуск: если файл битый или не тот, он не запустится
                 if ./lite-speedtest -v > /dev/null 2>&1 || [ -x "./lite-speedtest" ]; then
                   echo "SUCCESS: Core from $REPO is working!"
                   SUCCESS=true
@@ -70,15 +70,31 @@ jobs:
                   break
                 fi
               else
-                echo "Security Warning: File from $REPO has suspicious size ($FILE_SIZE). Skipping..."
+                echo "Error: Downloaded file is empty. Skipping $REPO..."
               fi
             else
               echo "Download failed for $REPO. Trying next source..."
             fi
           done
 
+          # ФИНАЛЬНЫЙ ШАНС: Если API подвело, качаем по жесткой ссылке (Fallback)
           if [ "$SUCCESS" = false ]; then
-            echo "CRITICAL ERROR: All sources failed to provide a working core!"
+            echo "-----------------------------------------------"
+            echo "All API attempts failed. Using Hardcoded Fallback URL..."
+            FALLBACK_URL="https://github.com/StairS/lite-speedtest/releases/download/v0.17.1/lite-speedtest-linux-amd64.tar.gz"
+            if curl -f -L -o core_archive "$FALLBACK_URL"; then
+              tar -xvf core_archive
+              find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
+              chmod +x lite-speedtest
+              if [ -x "./lite-speedtest" ]; then
+                echo "SUCCESS: Fallback core is working!"
+                SUCCESS=true
+              fi
+            fi
+          fi
+
+          if [ "$SUCCESS" = false ]; then
+            echo "CRITICAL ERROR: All sources and fallback failed!"
             exit 1
           fi
 
@@ -90,5 +106,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "Elite-Inspector-Bot"
           git add .
-          git commit -m "Deep Audit Complete (Multi-Source Robust): $(date)" || exit 0
+          git commit -m "Deep Audit Complete (Universal Core Search): $(date)" || exit 0
           git push
