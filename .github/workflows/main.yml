@@ -2,12 +2,13 @@ name: Elite Proxy Factory
 
 on:
   schedule:
-    # Запуск в 27-ю минуту каждого 3-го часа
+    # Runs at 27th minute of every 3rd hour
     - cron: '27 */3 * * *'
   push:
-    # Мгновенный запуск при обновлении твоих личных ссылок
+    # Trigger immediately when you save personal links
     paths:
       - 'my_personal_links.txt'
+      - 'sub_raw.txt'
   workflow_dispatch:
     inputs:
       full_audit:
@@ -48,14 +49,18 @@ jobs:
         run: |
           pip install requests maxminddb
 
-      - name: Step 1: Execute Mega Worker (TCP & GeoIP)
-        run: python worker.py
+      - name: 'Step 1: Execute Mega Worker (TCP & GeoIP)'
+        run: |
+          if [ -f "worker.py" ]; then
+            python worker.py
+          else
+            echo "worker.py not found, skipping Step 1"
+          fi
 
-      - name: Step 2: Execute Deep Inspector (HTTP & Latency)
+      - name: 'Step 2: Execute Deep Inspector (HTTP & Latency)'
         run: |
           if [[ "${{ github.event_name }}" == "push" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
             echo "RUNNING FULL AUDIT MODE..."
-            # Здесь вызывается второй бот (убедись, что файл называется main.py или измени имя)
             python main.py --full
           else
             echo "RUNNING STANDARD MODE..."
@@ -69,11 +74,11 @@ jobs:
           git config --global user.name "EliteFactoryBot"
           git config --global user.email "bot@github.com"
           
-          # Добавляем все результаты работы обоих ботов
+          # Adding all critical files from both bots
           git add my_stable_configs.txt my_personal_links.txt activity_log.txt sub_*.txt base64_*.txt status.json
           
-          # Фиксируем изменения с меткой пульса
+          # Force commit with pulse timestamp
           git commit -m "Auto-Pulse: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
           
-          # Пушим в основную ветку
+          # Push to the main branch
           git push origin main
