@@ -1,9 +1,11 @@
+name: Elite Proxy Factory
+
 on:
   schedule:
-    # Запуск каждые 3 часа на 27-й минуте (синхронно с твоим примером)
+    # Runs at 27th minute of every 3rd hour
     - cron: '27 */3 * * *'
   push:
-    # Мгновенный запуск при обновлении сырых ссылок
+    # Trigger immediately when you save raw links
     paths:
       - 'sub_raw.txt'
   workflow_dispatch:
@@ -63,11 +65,11 @@ jobs:
           git config --global user.name "EliteFactoryBot"
           git config --global user.email "bot@github.com"
           
-          # Добавляем результаты проверки
+          # Add results
           git add sub_*.txt base64_*.txt status.json
           
-          # Форсированный коммит с датой
-          git commit -m "Auto-Update: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
+          # Force commit even if proxy list hasn't changed
+          git commit -m "Auto-Pulse: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
           
-          # Пуш в основную ветку
+          # Push to the main branch
           git push origin main
