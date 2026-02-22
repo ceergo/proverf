@@ -1,63 +1,61 @@
-name: Elite Proxy Factory (Consumer)
+name: Elite Proxy Factory
 
 on:
   schedule:
-    - cron: '0 * * * *'    # Hourly quick check
-    - cron: '0 */6 * * *'  # Full Level 2 sweep every 6 hours
-  workflow_dispatch:        # Manual trigger
+    - cron: "0 * * * *"
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
     inputs:
       full_audit:
-        description: 'Perform deep L7 audit?'
+        description: "Perform deep L7 audit?"
         required: false
-        default: 'false'
+        default: "false"
         type: boolean
 
 jobs:
-  check_and_deploy:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      
+
     steps:
-      - name: Checkout Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
-      - name: Cache Xray Engine
+      - name: Cache Xray
         id: cache-xray
         uses: actions/cache@v3
         with:
           path: ./xray
           key: ${{ runner.os }}-xray-v1.8.4
 
-      - name: Download Xray Core
+      - name: Download Xray
         if: steps.cache-xray.outputs.cache-hit != 'true'
         run: |
           wget https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip
           unzip Xray-linux-64.zip xray
           chmod +x xray
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: pip install requests
 
-      - name: Run Proxy Factory Engine
+      - name: Execute Factory
         run: |
           if [[ "${{ github.event.schedule }}" == "0 */6 * * *" || "${{ github.event.inputs.full_audit }}" == "true" ]]; then
-            echo "RUNNING FULL L7 AUDIT..."
             python main.py --full
           else
-            echo "RUNNING HOURLY SYNC..."
             python main.py
           fi
 
-      - name: Push Results to Repository
+      - name: Deploy Results
         run: |
-          git config --local user.email "consumer-bot@proxy.factory"
+          git config --local user.email "factory@proxy.bot"
           git config --local user.name "Elite Factory Bot"
           git add sub_*.txt base64_*.txt status.json
-          git commit -m "🔄 Update: Level 2 Verified Subscriptions [skip ci]" || exit 0
+          git commit -m "🔄 Subscriptions Updated [skip ci]" || exit 0
           git push
