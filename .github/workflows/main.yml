@@ -22,47 +22,65 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Smart Download Latest Core (StairS)
+      - name: Robust Multi-Source Download (StairS -> xxf002 -> Fallback)
         run: |
-          # Динамический поиск самого свежего релиза через GitHub API
-          # Мы используем проект StairS как самый ликвидный (обновления 2024-2025)
-          REPO="StairS/lite-speedtest"
-          API_URL="https://api.github.com/repos/$REPO/releases/latest"
-          
-          echo "Fetching metadata for latest release of $REPO..."
-          
-          # Находим URL ассета, который содержит 'linux' и 'amd64' и заканчивается на .tar.gz или .gz
-          DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
-          
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            echo "Error: Could not find a valid linux-amd64 binary in the latest release!"
+          # Список надежных репозиториев (в порядке приоритета)
+          REPOS=("StairS/lite-speedtest" "xxf002/lite-speedtest" "Yidadaa/v2ray-speedtest")
+          SUCCESS=false
+
+          for REPO in "${REPOS[@]}"; do
+            echo "-----------------------------------------------"
+            echo "Attempting to fetch latest core from: $REPO"
+            
+            API_URL="https://api.github.com/repos/$REPO/releases/latest"
+            DOWNLOAD_URL=$(curl -s $API_URL | jq -r '.assets[] | select(.name | contains("linux") and contains("amd64") and (contains(".tar.gz") or contains(".gz"))) | .browser_download_url' | head -n 1)
+
+            if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+              echo "No valid assets found in $REPO. Skipping..."
+              continue
+            fi
+
+            echo "Download URL found: $DOWNLOAD_URL"
+            if curl -f -L -o core_archive "$DOWNLOAD_URL"; then
+              
+              # Проверка безопасности (размер)
+              FILE_SIZE=$(stat -c%s "core_archive")
+              MIN_SIZE=3145728  # 3 MB
+              MAX_SIZE=52428800 # 50 MB
+              
+              if [ "$FILE_SIZE" -ge "$MIN_SIZE" ] && [ "$FILE_SIZE" -le "$MAX_SIZE" ]; then
+                echo "File size validated: $FILE_SIZE bytes."
+                
+                # Распаковка
+                if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
+                  tar -xvf core_archive || continue
+                else
+                  gunzip -c core_archive > lite-speedtest || continue
+                fi
+                
+                # Поиск бинарника
+                find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
+                chmod +x lite-speedtest
+                
+                # Финальный тест запуска
+                if ./lite-speedtest -v > /dev/null 2>&1 || [ -x "./lite-speedtest" ]; then
+                  echo "SUCCESS: Core from $REPO is working!"
+                  SUCCESS=true
+                  echo "$FILE_SIZE" > last_core_size.txt
+                  break
+                fi
+              else
+                echo "Security Warning: File from $REPO has suspicious size ($FILE_SIZE). Skipping..."
+              fi
+            else
+              echo "Download failed for $REPO. Trying next source..."
+            fi
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "CRITICAL ERROR: All sources failed to provide a working core!"
             exit 1
           fi
-          
-          echo "Found latest version. Downloading from: $DOWNLOAD_URL"
-          curl -L -o core_archive "$DOWNLOAD_URL"
-          
-          # Распаковка в зависимости от расширения
-          if [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
-            tar -xvf core_archive
-          else
-            gunzip -c core_archive > lite-speedtest
-          fi
-          
-          # Находим сам бинарник (он может быть переименован или лежать в подпапке)
-          # Логика: ищем файл, который начинается на lite-speedtest, является файлом и не имеет расширений архивов
-          find . -name "lite-speedtest*" -type f -not -name "*.gz" -not -name "*.tar*" -exec mv {} ./lite-speedtest \;
-          
-          chmod +x lite-speedtest
-          
-          # Проверка работоспособности
-          if [ ! -x "./lite-speedtest" ]; then
-            echo "Critical Error: Binary not found or not executable!"
-            ls -la
-            exit 1
-          fi
-          
-          echo "Success: Modern core is ready. Size: $(stat -c%s lite-speedtest) bytes."
 
       - name: Run Sieve Orchestrator
         run: python main.py
@@ -72,6 +90,5 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "Elite-Inspector-Bot"
           git add .
-          # Фиксируем результаты только если они изменились
-          git commit -m "Deep Audit Complete (Auto-Updated Core): $(date)" || exit 0
+          git commit -m "Deep Audit Complete (Multi-Source Robust): $(date)" || exit 0
           git push
