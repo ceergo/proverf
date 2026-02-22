@@ -74,10 +74,14 @@ jobs:
           git config --global user.name "EliteFactoryBot"
           git config --global user.email "bot@github.com"
           
-          # Adding all critical files from both bots
-          git add my_stable_configs.txt my_personal_links.txt activity_log.txt sub_*.txt base64_*.txt status.json
+          # Безопасное добавление файлов: только если они существуют
+          for file in my_stable_configs.txt my_personal_links.txt activity_log.txt sub_elite.txt sub_fast.txt sub_cis.txt sub_brave.txt base64_elite.txt base64_fast.txt base64_cis.txt base64_brave.txt status.json; do
+            if [ -f "$file" ]; then
+              git add "$file"
+            fi
+          done
           
-          # Force commit with pulse timestamp
+          # Force commit with pulse timestamp (даже если список файлов не изменился)
           git commit -m "Auto-Pulse: $(date +'%Y-%m-%d %H:%M') [Level 2 Verified]" --allow-empty
           
           # Push to the main branch
