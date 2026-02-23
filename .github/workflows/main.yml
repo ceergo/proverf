@@ -19,7 +19,9 @@ jobs:
 
       - name: Install Xray-core
         run: |
-          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+          # Added sudo to bypass root check
+          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version latest
+          sudo chmod +x /usr/local/bin/xray
           xray -version
 
       - name: Install Librespeed CLI
