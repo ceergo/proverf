@@ -8,69 +8,78 @@ on:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Явное разрешение на запись для GitHub Actions
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip wget curl jq
+          sudo apt-get install -y unzip wget curl jq psmisc
 
-      - name: Install Xray-core (Direct Binary)
+      - name: Install Xray-core (Matching main.py path)
         run: |
-          echo "Installing latest Xray-core via direct redirect URL..."
-          # Using the stable redirect link provided by GitHub releases
+          echo "Installing Xray-core as local binary..."
           wget -O xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          
-          # Use a temporary directory to avoid file conflicts (README, etc.)
           mkdir -p ./xray_temp
           unzip -q xray.zip -d ./xray_temp
-          
-          # Move only the binary we need
-          chmod +x ./xray_temp/xray
-          sudo mv ./xray_temp/xray /usr/local/bin/xray
-          
-          # Cleanup
+          # Перемещаем в корень, как указано в XRAY_PATH = "xray"
+          mv ./xray_temp/xray ./xray
+          chmod +x ./xray
           rm -rf xray.zip ./xray_temp
-          xray -version
+          ./xray -version
 
-      - name: Install Librespeed CLI
+      - name: Install Librespeed CLI (Matching main.py path)
         run: |
-          # Download latest release from Librespeed using redirect strategy
-          echo "Installing latest Librespeed CLI..."
+          echo "Installing Librespeed CLI as local binary..."
           LATEST_URL=$(curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
           | grep "browser_download_url.*linux_amd64.tar.gz" \
           | cut -d : -f 2,3 \
           | tr -d \" | xargs)
           
           if [ -z "$LATEST_URL" ]; then
-            echo "Fallback to manual URL for Librespeed"
             LATEST_URL="https://github.com/librespeed/speedtest-cli/releases/download/v1.1.5/librespeed-cli-linux-amd64.tar.gz"
           fi
 
           wget -O librespeed.tar.gz $LATEST_URL
           tar -xzf librespeed.tar.gz
-          find . -name "librespeed-cli*" -exec mv {} librespeed-cli \;
-          chmod +x librespeed-cli
+          # Перемещаем в корень, как указано в LIBRESPEED_PATH = "./librespeed-cli"
+          find . -name "librespeed-cli*" -exec mv {} ./librespeed-cli \;
+          chmod +x ./librespeed-cli
           ./librespeed-cli --version
 
       - name: Run Sieve Orchestrator
         run: |
+          # Убеждаемся, что зависимости установлены
+          pip install aiohttp requests
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           python main.py
 
-      - name: Commit and Push Results
+      - name: Commit and Push Results (Prevention of Loop)
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          touch Elite_Gemini.txt Stable_Chat.txt Fast_NoGoogle.txt
+          # Создаем файлы, если их нет
+          touch Elite_Gemini.txt Stable_Chat.txt Fast_NoGoogle.txt dead_cache.txt last_cleanup.txt
           
           git add .
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Deep Audit Complete (Xray Mode): $(date -u)" && git push)
+          
+          # Проверяем наличие изменений. 
+          # Флаг [skip ci] в сообщении коммита предотвращает повторный запуск workflow при пуше.
+          if ! git diff --staged --quiet; then
+            git commit -m "Deep Audit Complete: $(date -u) [skip ci]"
+            git push origin main
+          else
+            echo "No changes to commit."
+          fi
