@@ -22,7 +22,7 @@ def load_config():
     """Loads global settings from a JSON file."""
     if not os.path.exists(CONFIG_PATH):
         print(f"[{datetime.now().strftime('%H:%M:%S')}] CRITICAL ERROR: {CONFIG_PATH} not found!")
-        # Create a default config if it doesn't exist to prevent crash (optional)
+        # Stop execution if config is missing to avoid undefined behavior
         sys.exit(1)
     with open(CONFIG_PATH, "r") as f:
         return json.load(f)
@@ -313,7 +313,10 @@ async def main_orchestrator():
                 if cat in ["DEAD", "ERROR"]:
                     with open(FILES["DEAD_CACHE"], "a") as f: f.write(get_md5(link) + "\n")
                 elif cat in FILES["RESULTS"]:
-                    with open(FILES["RESULTS"][cat], "a") as f: f.write(f"{link}\n")
+                    # Create directory for result files if they don't exist
+                    result_path = FILES["RESULTS"][cat]
+                    os.makedirs(os.path.dirname(result_path), exist_ok=True) if os.path.dirname(result_path) else None
+                    with open(result_path, "a") as f: f.write(f"{link}\n")
             
             # Update temp pool to allow resuming after crash
             with open(FILES["TEMP_POOL"], "w") as f: json.dump(candidates[i+NET["BATCH_SIZE"]:], f)
