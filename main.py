@@ -9,6 +9,7 @@ import sys
 import base64
 import shutil
 from datetime import datetime, timedelta
+import aiohttp
 
 # --- CONFIGURATION ---
 RAW_LINKS_FILE = "raw_links.txt"
@@ -22,13 +23,12 @@ FAST_NO_GOOGLE = "Fast_NoGoogle.txt"
 
 RESULT_FILES = [ELITE_GEMINI, STABLE_CHAT, FAST_NO_GOOGLE]
 
-# Paths for Binaries (Assumed installed via workflow)
-XRAY_PATH = "xray" # If in PATH
-LIBRESPEED_PATH = "./librespeed-cli" # Local binary
+# Paths for Binaries
+XRAY_PATH = "xray" 
+LIBRESPEED_PATH = "./librespeed-cli" 
 
 # Critical Links
 GEMINI_CHECK_URL = "https://aistudio.google.com/app"
-SPEED_TEST_URL = "http://speedtest.tele2.net/1MB.zip" # Fallback if librespeed fails
 
 def log_event(msg):
     """Real-time logging for GitHub Actions."""
@@ -53,17 +53,39 @@ def manage_cache_lifecycle():
         with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
 
 def extract_configs_from_text(text):
+    """Extracts proxy links and handles Base64 decoding if necessary."""
+    # Attempt to decode Base64 if the whole block looks like it
+    try:
+        decoded = base64.b64decode(text.strip()).decode('utf-8')
+        text = decoded
+    except:
+        pass
+        
     pattern = r'(vless|vmess|ss|trojan)://[^\s|#]+(?:#[^\s]*)?'
     found = re.findall(pattern, text, re.IGNORECASE)
     return list(set(found))
 
+async def fetch_external_subs(urls):
+    """Downloads content from external subscription URLs."""
+    all_links = []
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            if not url.startswith('http'): continue
+            log_event(f"[FETCH] Downloading subscription: {url}")
+            try:
+                async with session.get(url, timeout=15) as resp:
+                    if resp.status == 200:
+                        content = await resp.text()
+                        found = extract_configs_from_text(content)
+                        log_event(f"  [+] Found {len(found)} nodes in sub.")
+                        all_links.extend(found)
+            except Exception as e:
+                log_event(f"  [!] Failed to fetch sub: {e}")
+    return all_links
+
 def parse_vless_link(link):
-    """
-    Very basic VLESS parser to extract main components for Xray config.
-    In real scenarios, use a robust library or more complex regex.
-    """
     try:
-        # vless://uuid@host:port?query#name
+        # Simple extraction for VLESS
         pattern = r'vless://([^@]+)@([^:]+):(\d+)\?([^#]+)'
         match = re.match(pattern, link)
         if not match: return None
@@ -83,7 +105,6 @@ def parse_vless_link(link):
     except: return None
 
 def generate_xray_config(parsed_link, local_port):
-    """Generates a JSON config for Xray-core."""
     config = {
         "log": {"loglevel": "none"},
         "inbounds": [{
@@ -112,9 +133,7 @@ def generate_xray_config(parsed_link, local_port):
     return config
 
 async def check_gemini_access(socks_port):
-    """Checks if Gemini is accessible via the SOCKS5 tunnel."""
     try:
-        # Use socks5h to ensure DNS is resolved through the proxy
         proxy_url = f"socks5h://127.0.0.1:{socks_port}"
         cmd = [
             "curl", "-s", "-L", "-k", "--proxy", proxy_url,
@@ -124,122 +143,89 @@ async def check_gemini_access(socks_port):
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
-        
-        if res == "200":
-            return True, "OK"
-        return False, f"HTTP_{res}"
-    except Exception as e:
-        return False, str(e)
+        return (True, "OK") if "200" in res else (False, f"HTTP_{res}")
+    except:
+        return False, "Error"
 
 async def measure_speed_librespeed(socks_port):
-    """Measures speed using Librespeed CLI via the tunnel."""
     try:
-        # Note: Official Librespeed CLI might need specific proxy env or args
-        # This is a template call - adjust based on specific CLI version installed
-        cmd = [
-            LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}",
-            "--json", "--duration", "5"
-        ]
+        # Template for librespeed-cli via socks
+        cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "5"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = await proc.communicate()
-        
+        stdout, _ = await proc.communicate()
         if proc.returncode == 0:
             data = json.loads(stdout.decode())
-            down = data.get("download", 0) / 1024 / 1024 # Mbps
-            ping = data.get("ping", 0)
-            return round(down, 2), round(ping, 1)
+            return round(data.get("download", 0) / 1024 / 1024, 2), round(data.get("ping", 0), 1)
         return 0, 0
     except:
         return 0, 0
 
 async def audit_single_link(link, local_port):
     proxy_id = get_md5(link)[:8]
-    log_event(f"[AUDIT:{proxy_id}] Starting Deep Sieve...")
-    
     parsed = parse_vless_link(link)
-    if not parsed:
-        log_event(f"  [!] Failed to parse VLESS link structure.")
-        return link, "DEAD", 0
+    if not parsed: return link, "DEAD", 0
     
     config = generate_xray_config(parsed, local_port)
     config_path = f"config_{proxy_id}.json"
-    with open(config_path, "w") as f:
-        json.dump(config, f)
+    with open(config_path, "w") as f: json.dump(config, f)
         
-    # Start Xray
     try:
-        xray_proc = subprocess.Popen(
-            [XRAY_PATH, "-c", config_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        await asyncio.sleep(2) # Wait for tunnel to stabilize
+        xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(2)
         
-        # 1. Check Gemini Access
-        is_gemini, gemini_msg = await check_gemini_access(local_port)
-        log_event(f"  [>] Gemini: {gemini_msg}")
-        
-        # 2. Measure Speed
+        is_gemini, g_msg = await check_gemini_access(local_port)
         speed, ping = await measure_speed_librespeed(local_port)
-        log_event(f"  [>] Speed: {speed} Mbps | Ping: {ping}ms")
         
-        # Verdict
         verdict = "DEAD"
         if is_gemini and speed >= 1.0: verdict = "ELITE"
-        elif is_gemini and speed >= 0.1: verdict = "STABLE"
+        elif is_gemini: verdict = "STABLE"
         elif speed >= 3.0: verdict = "FAST_NO_GOOGLE"
         
-        log_event(f"[AUDIT:{proxy_id}] VERDICT: {verdict}\n")
+        log_event(f"[{proxy_id}] {verdict} | {speed}Mbps | {g_msg}")
         
-        # Cleanup process
         xray_proc.terminate()
         os.remove(config_path)
         return link, verdict, speed
-        
-    except Exception as e:
-        log_event(f"  [ERROR] Xray Crash: {e}")
+    except:
         return link, "DEAD", 0
 
 async def main_orchestrator():
     log_event("--- SIERRA X-RAY ORCHESTRATOR ONLINE ---")
     manage_cache_lifecycle()
     
-    # Check for binaries
-    if not shutil.which(XRAY_PATH):
-        log_event("[CRITICAL] Xray binary not found! Ensure it's installed in Workflow.")
-        return
-
-    # Load Links
     if not os.path.exists(RAW_LINKS_FILE):
-        log_event(f"[ERROR] {RAW_LINKS_FILE} missing.")
+        log_event("[ERROR] raw_links.txt missing.")
         return
 
     with open(RAW_LINKS_FILE, "r") as f:
-        content = f.read()
+        lines = [l.strip() for l in f if l.strip()]
     
-    # Expanding sub links (Simplified for this version)
-    links = extract_configs_from_text(content)
-    log_event(f"[PARSER] Found {len(links)} candidate nodes.")
+    # 1. Separate URLs from direct configs
+    sub_urls = [l for l in lines if l.startswith('http')]
+    direct_configs = [l for l in lines if '://' in l and not l.startswith('http')]
+    
+    # 2. Fetch external subs
+    fetched_links = await fetch_external_subs(sub_urls)
+    total_candidates = list(set(direct_configs + fetched_links))
+    
+    log_event(f"[PARSER] Total candidate nodes: {len(total_candidates)}")
 
-    # Load Dead Cache
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             dead_cache = set(line.strip() for line in f)
 
-    # Filtering
-    fresh_links = [l for l in links if get_md5(l) not in dead_cache]
+    fresh_links = [l for l in total_candidates if get_md5(l) not in dead_cache]
     log_event(f"[PARSER] Processing {len(fresh_links)} fresh nodes.")
 
-    # Audit Loop (Sequential to avoid port conflicts and CPU spikes in Actions)
     base_port = 10808
-    for i, link in enumerate(fresh_links):
+    for link in fresh_links:
         res_link, cat, speed = await audit_single_link(link, base_port)
-        
         if cat == "DEAD":
             with open(DEAD_CACHE_FILE, "a") as f: f.write(get_md5(res_link) + "\n")
         else:
-            target_file = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
-            with open(target_file, "a") as f:
+            fname = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
+            with open(fname, "a") as f:
                 f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
 
     log_event("--- AUDIT COMPLETE ---")
