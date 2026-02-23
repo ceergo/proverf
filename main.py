@@ -123,38 +123,45 @@ async def measure_speed_librespeed(socks_port):
     return 0.0, 0.0
 
 async def audit_single_link(link, local_port, semaphore):
-    """Full lifecycle check for a single proxy link."""
+    """Full lifecycle check for a single proxy link with detailed logging."""
     async with semaphore:
         l_hash = get_md5(link)
         async with file_lock:
-            # Check files in the result folder directly
             for path in Config.RESULT_FILES.values():
                 if os.path.exists(path) and l_hash in open(path).read():
                     stats.processed += 1
                     return link, "ALREADY_DONE", 0, 0
+        
         parsed = parse_proxy_link(link)
         if not parsed:
             stats.processed += 1; stats.dead += 1
+            log_node_details(link, None, "INVALID_FORMAT")
             return link, "INVALID_FORMAT", 0, 0
+
         config_path = f"cfg_{l_hash[:6]}_{local_port}.json"
         with open(config_path, "w") as f: json.dump(generate_xray_config(parsed, local_port), f)
+        
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([Config.XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             await asyncio.sleep(4)
+            
             is_gemini, gemini_code = await check_gemini_access(local_port)
             speed, ping = 0.0, 0.0
+            
             if is_gemini or (gemini_code not in ["ERR", "000"]):
                 speed, ping = await measure_speed_librespeed(local_port)
+            
             cat = "DEAD"
             if is_gemini and speed >= 0.8: cat = "ELITE"; stats.elite += 1
             elif is_gemini or (0.1 < speed < 1.0): cat = "STABLE"; stats.stable += 1
             elif speed >= 1.0: cat = "FAST_NO_GOOGLE"; stats.fast += 1
             else: stats.dead += 1
             
-            # log_node_details will handle record keeping
+            # Detailed console output for each node
             log_node_details(link, parsed, cat, speed, ping)
             return link, cat, speed, ping
+            
         except Exception as e:
             stats.errors += 1
             log_error_details(link, e, context="AUDIT")
@@ -170,21 +177,24 @@ async def audit_single_link(link, local_port, semaphore):
 
 # --- MAIN FLOW ---
 async def main_orchestrator():
-    """Main entry point: orchestrates the overall audit process."""
+    """Main entry point: orchestrates the overall audit process with full logging."""
     if os.path.exists(Config.LOCK_FILE):
         if time.time() - os.path.getmtime(Config.LOCK_FILE) < 1200:
+            print(f"🚫 [{datetime.now().strftime('%H:%M:%S')}] Бот уже запущен.")
             sys.exit(0)
             
     with open(Config.LOCK_FILE, "w") as f: f.write(str(os.getpid()))
+    
     try:
-        # Initial cleanup
+        log_event("🚀 СТАРТ: Полномасштабный аудит прокси", "SYSTEM")
         kill_process_by_name("xray")
         manage_cache_lifecycle(Config)
         
-        # We always start with fresh pool from raw_links.txt
+        # Pulling fresh pool
         total_pool = await prepare_task_pool(Config)
             
         if not total_pool: 
+            log_event(f"🛑 Файл {Config.RAW_LINKS_FILE} пуст или не найден.", "ERROR")
             return
 
         dead_cache = set()
@@ -194,34 +204,37 @@ async def main_orchestrator():
         active_nodes = [l for l in total_pool if get_md5(l) not in dead_cache]
         stats.total = len(active_nodes)
         
+        log_event(f"📥 Загружено: {len(total_pool)} нод. К проверке: {stats.total}", "INFO")
+        
         if not active_nodes:
+            log_event("📭 Очередь пуста (все ноды уже обработаны).", "INFO")
             return
             
-        # Logging based on the actual file content state
-        log_event(f"📊 Пул активных задач: {stats.total}. Проверка запущена.", "SYSTEM")
-        
         semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_TESTS)
         
+        # Batch processing with progress tracking
         for i in range(0, len(active_nodes), Config.BATCH_SIZE):
             batch = active_nodes[i : i + Config.BATCH_SIZE]
+            log_event(f"📦 Обработка пачки {i//Config.BATCH_SIZE + 1} ({len(batch)} шт.)", "SYSTEM")
+            
             tasks = [audit_single_link(l, Config.BASE_PORT + (idx % Config.PORT_RANGE), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
             
-            # Save results (writing to files in the result folder)
+            # Save results and update log
             await save_audit_results(results, Config, file_lock)
-            
-            # log_progress will sync terminal output with folder contents
             log_progress()
             
-        # log_summary pulls final stats from folder
         log_summary()
+        log_event("🏁 АУДИТ ЗАВЕРШЕН ПОЛНОСТЬЮ", "SYSTEM")
+        
     finally:
         if os.path.exists(Config.LOCK_FILE): os.remove(Config.LOCK_FILE)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_orchestrator())
-    except KeyboardInterrupt: pass
+    except KeyboardInterrupt:
+        print("\n🛑 Прервано пользователем.")
     except Exception as e:
         log_error_details("MAIN", e, "CRITICAL")
         if os.path.exists(Config.LOCK_FILE): os.remove(Config.LOCK_FILE)
