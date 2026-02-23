@@ -24,7 +24,7 @@ jobs:
 
       - name: Install Xray-core (Direct Binary)
         run: |
-          # More robust way to get the latest tag name
+          # Get latest tag
           XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
           if [ "$XRAY_VERSION" == "null" ] || [ -z "$XRAY_VERSION" ]; then
             XRAY_VERSION="v24.12.31"
@@ -33,11 +33,16 @@ jobs:
           echo "Installing Xray $XRAY_VERSION"
           wget -O xray.zip https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-linux-64.zip
           
-          # Force overwrite and extract ONLY the xray binary to avoid conflicts
-          unzip -o xray.zip xray
-          chmod +x xray
-          sudo mv xray /usr/local/bin/xray
-          rm -f xray.zip
+          # Use a temporary directory to avoid file conflicts (README, etc.)
+          mkdir -p ./xray_temp
+          unzip -q xray.zip -d ./xray_temp
+          
+          # Move only the binary we need
+          chmod +x ./xray_temp/xray
+          sudo mv ./xray_temp/xray /usr/local/bin/xray
+          
+          # Cleanup
+          rm -rf xray.zip ./xray_temp
           xray -version
 
       - name: Install Librespeed CLI
