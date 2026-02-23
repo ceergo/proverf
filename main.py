@@ -35,10 +35,11 @@ LIBRESPEED_PATH = "./librespeed-cli"
 # Critical Links
 GEMINI_CHECK_URL = "https://aistudio.google.com/app"
 
-# Concurrency & Networking
-MAX_CONCURRENT_TESTS = 5  
-BATCH_SIZE = 10           
-BASE_PORT = 10800         
+# --- HIGH LOAD PARAMETERS ---
+MAX_CONCURRENT_TESTS = 15   # Увеличено до 15 для 50к ссылок
+BATCH_SIZE = 30            # Больше батч для снижения нагрузки на диск
+BASE_PORT = 11000          # Смещение портов, чтобы не конфликтовать со старыми
+PORT_RANGE = 100           # Запас портов для параллельных тестов
 
 # Browser Emulation Headers
 HEADERS = {
@@ -48,12 +49,28 @@ HEADERS = {
 # Global lock for file operations
 file_lock = asyncio.Lock()
 
-def log_event(msg):
+# --- COUNTERS ---
+stats = {
+    "total": 0,
+    "processed": 0,
+    "elite": 0,
+    "stable": 0,
+    "fast": 0,
+    "dead": 0,
+    "errors": 0
+}
+
+def log_event(msg, level="INFO"):
     """
-    Real-time logging with timestamps.
+    Advanced logging with levels and progress.
     """
     timestamp = datetime.now().strftime('%H:%M:%S')
-    print(f"[{timestamp}] {msg}", flush=True)
+    progress = ""
+    if stats["total"] > 0:
+        percent = (stats["processed"] / stats["total"]) * 100
+        progress = f"[{percent:.1f}%]"
+    
+    print(f"[{timestamp}] {progress} [{level}] {msg}", flush=True)
 
 def kill_process_by_name(name):
     """
@@ -92,7 +109,7 @@ def manage_cache_lifecycle():
             try:
                 last_run = datetime.fromisoformat(f.read().strip())
                 if now - last_run > timedelta(hours=72):
-                    log_event("🧹 Цикл 72 часа: Очищаем базу мертвых ссылок...")
+                    log_event("🧹 Цикл 72 часа: Очищаем базу мертвых ссылок...", "MAINTENANCE")
                     if os.path.exists(DEAD_CACHE_FILE): 
                         os.remove(DEAD_CACHE_FILE)
                     with open(CLEANUP_LOG, "w") as f_out: 
@@ -106,6 +123,7 @@ def manage_cache_lifecycle():
 def extract_server_identity(link):
     """
     Identifies server by Host:Port to prevent redundant testing.
+    Essential for 50k+ link pools to avoid testing same server multiple times.
     """
     try:
         if "://" not in link: return link
@@ -134,19 +152,14 @@ def clean_garbage(link):
     if not link:
         return ""
     
-    # Remove all whitespace and handle protocol start
     link = link.strip()
     protocol_match = re.search(r'(vless|vmess|trojan|ss|hy2)://', link, re.IGNORECASE)
     if protocol_match:
         link = link[protocol_match.start():]
     
-    # Remove invisible characters but keep base64/params
     link = "".join(char for char in link if ord(char) > 32 and ord(char) < 127)
     
-    # Note: We don't split by '#' here if it's VMESS or contains encoded data
-    # only if it looks like a standard remark tail
     if not link.lower().startswith("vmess://") and "#" in link:
-        # Check if # is followed by typical remark characters
         parts = link.split("#", 1)
         link = parts[0]
         
@@ -154,59 +167,32 @@ def clean_garbage(link):
 
 def extract_configs_from_text(text, depth=0):
     """
-    Optimized extractor: Handles RAW lists, Base64 and mixed text.
+    High-performance extractor for large text blocks.
     """
-    if depth > 1: return []
+    if depth > 1 or not text: return []
     
-    # Flexible pattern for proxy protocols
+    # Регулярка оптимизирована для быстрого поиска в больших объемах
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
     
-    # Clean up common delimiters that break regex
     clean_text = text.replace('\\n', '\n').replace('\\r', '\r')
-    
     found_raw = []
     
-    # 1. Direct Regex Search
+    # Поиск по регулярке
     matches = re.finditer(pattern, clean_text, re.IGNORECASE)
     for m in matches:
-        link = m.group(0).strip()
-        # Clean trailing punctuation from text blocks
-        link = re.sub(r'[.,;)]}$]+$', '', link)
-        link = clean_garbage(link)
-        if link:
-            found_raw.append(link)
+        link = clean_garbage(m.group(0))
+        if link: found_raw.append(link)
 
-    # 2. Line-by-Line fallback for RAW lists (like GitHub raw)
-    if not found_raw or len(found_raw) < 5:
-        lines = clean_text.splitlines()
-        for line in lines:
-            line = line.strip()
-            if any(proto in line.lower() for proto in ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://']):
-                link = clean_garbage(line)
-                if link: found_raw.append(link)
-
-    # 3. Base64 Detection (Full page or chunks)
-    if depth == 0:
+    # Если ничего не найдено, пробуем Base64 (подписки часто кодированы целиком)
+    if not found_raw and depth == 0:
         try:
-            # Try to decode the whole block if it looks like a subscription
-            if not any(p in clean_text.lower() for p in ['://']):
-                padded = clean_text.strip() + "=" * (-len(clean_text.strip()) % 4)
-                try:
-                    decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-                    found_raw.extend(extract_configs_from_text(decoded, depth + 1))
-                except: pass
-            
-            # Find base64 chunks in mixed text
-            potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', clean_text)
-            for chunk in potential_b64:
-                padded = chunk + "=" * (-len(chunk) % 4)
-                try:
-                    decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-                    if any(p in decoded.lower() for p in ['vless://', 'vmess://', 'trojan://']):
-                        found_raw.extend(extract_configs_from_text(decoded, depth + 1))
-                except: continue
-        except:
-            pass
+            trimmed = clean_text.strip()
+            if len(trimmed) > 20 and re.match(r'^[a-zA-Z0-9+/=\s]+$', trimmed):
+                padded = trimmed.replace('\n', '').replace('\r', '')
+                padded += "=" * (-len(padded) % 4)
+                decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+                found_raw.extend(extract_configs_from_text(decoded, depth + 1))
+        except: pass
 
     return list(set(found_raw))
 
@@ -215,24 +201,24 @@ async def fetch_external_subs(urls):
     Downloads subscription content and extracts clean links.
     """
     all_links = []
-    timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=20)
+    timeout = aiohttp.ClientTimeout(total=90, connect=20, sock_read=30)
     async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
         for url in urls:
             url = url.strip()
             if not url.startswith('http'): continue
-            log_event(f"📡 Загрузка: {url[:60]}...")
+            log_event(f"📡 Загрузка подписки: {url[:50]}...", "NET")
             try:
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.text()
                         if content:
                             found = extract_configs_from_text(content)
-                            log_event(f"✅ Найдено {len(found)} нод в подписке.")
+                            log_event(f"📥 Получено {len(found)} нод из подписки.", "DATA")
                             all_links.extend(found)
                     else:
-                        log_event(f"⚠️ Ошибка {resp.status} для {url[:30]}")
+                        log_event(f"⚠️ Ошибка HTTP {resp.status} на {url[:30]}", "WARN")
             except Exception as e:
-                log_event(f"❌ Ошибка загрузки {url[:30]}: {str(e)}")
+                log_event(f"❌ Сбой загрузки {url[:30]}: {str(e)}", "ERROR")
     return all_links
 
 def parse_proxy_link(link):
@@ -339,23 +325,24 @@ async def check_gemini_access(socks_port):
             res = stdout.decode().strip()
             return ("200" in res or "302" in res), res
         except asyncio.TimeoutError:
-            if proc: proc.kill()
+            if proc: 
+                try: proc.kill()
+                except: pass
             return False, "TIMEOUT"
     except: return False, "ERR"
 
 async def measure_speed_librespeed(socks_port):
     """
-    Speed test via Librespeed CLI with memory optimization (shorter duration).
+    Speed test via Librespeed CLI with memory optimization.
     """
     try:
         if not os.path.exists(LIBRESPEED_PATH):
             return 0.0, 0.0
             
-        # Reduced duration to 7s to save memory and time
         cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "7"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=18)
             if proc.returncode == 0:
                 data = json.loads(stdout.decode())
                 return round(data.get("download", 0) / 1024 / 1024, 2), round(data.get("ping", 0), 1)
@@ -368,47 +355,68 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Audit process for a single proxy node with strict process management.
+    Audit process for a single proxy node with detailed logs.
     """
     async with semaphore:
         link_md5 = get_md5(link)
         
-        # Pre-check results to avoid work
+        # Проверка дублей в результатах
         async with file_lock:
             for rf in RESULT_FILES:
                 if os.path.exists(rf):
                     with open(rf, "r") as f:
-                        if link_md5 in f.read(): return link, "ALREADY_DONE", 0
+                        if link_md5 in f.read():
+                            stats["processed"] += 1
+                            return link, "ALREADY_DONE", 0
         
         parsed = parse_proxy_link(link)
-        if not parsed: return link, "DEAD", 0
+        if not parsed:
+            stats["processed"] += 1
+            stats["dead"] += 1
+            return link, "INVALID_FORMAT", 0
         
-        config_path = f"cfg_{link_md5[:5]}_{local_port}.json"
-        with open(config_path, "w") as f: json.dump(generate_xray_config(parsed, local_port), f)
+        config_path = f"cfg_{link_md5[:6]}_{local_port}.json"
+        with open(config_path, "w") as f: 
+            json.dump(generate_xray_config(parsed, local_port), f)
             
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(5) # Standard wait for startup
+            await asyncio.sleep(4) # Ожидание старта Xray
             
-            is_gemini, _ = await check_gemini_access(local_port)
-            speed, ping = await measure_speed_librespeed(local_port)
+            # Проверка коннекта
+            is_gemini, gemini_code = await check_gemini_access(local_port)
+            
+            speed = 0.0
+            ping = 0.0
+            if is_gemini or gemini_code != "ERR":
+                speed, ping = await measure_speed_librespeed(local_port)
             
             cat = "DEAD"
-            if is_gemini and speed >= 0.8: cat = "ELITE"
-            elif is_gemini or (speed > 0.05 and speed < 1.0): cat = "STABLE"
-            elif speed >= 1.0: cat = "FAST_NO_GOOGLE"
+            if is_gemini and speed >= 0.8: 
+                cat = "ELITE"
+                stats["elite"] += 1
+            elif is_gemini or (speed > 0.1 and speed < 1.0): 
+                cat = "STABLE"
+                stats["stable"] += 1
+            elif speed >= 1.0: 
+                cat = "FAST_NO_GOOGLE"
+                stats["fast"] += 1
+            else:
+                stats["dead"] += 1
             
-            log_event(f"Node {link_md5[:6]} -> {cat} ({speed} Mbps)")
+            log_event(f"Нода {link_md5[:6]} -> {cat} | Speed: {speed} Mbps | Ping: {ping}ms", "AUDIT")
             return link, cat, speed
-        except Exception as e: 
+            
+        except Exception as e:
+            stats["errors"] += 1
             return link, f"ERROR: {str(e)[:20]}", 0
         finally:
+            stats["processed"] += 1
             if xray_proc:
                 try:
                     xray_proc.terminate()
-                    # Hard kill if not dead in 2s
-                    for _ in range(20):
+                    for _ in range(10):
                         if xray_proc.poll() is not None: break
                         await asyncio.sleep(0.1)
                     if xray_proc.poll() is None: xray_proc.kill()
@@ -419,80 +427,96 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main loop with optimized batching and snapshot management.
+    High-load orchestrator for processing 50k+ nodes.
     """
     if os.path.exists(LOCK_FILE):
         mtime = os.path.getmtime(LOCK_FILE)
-        if time.time() - mtime < 900: 
-            print("🚫 СИСТЕМА ЗАБЛОКИРОВАНА: Процесс активен.")
+        if time.time() - mtime < 1200: 
+            print("🚫 Блокировка: Бот уже запущен.")
             sys.exit(0)
     
     with open(LOCK_FILE, "w") as f: f.write(str(os.getpid()))
     
     try:
-        log_event("🛑 ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ПОРТОВ...")
+        log_event("🚀 ЗАПУСК В РЕЖИМЕ ВЫСОКОЙ НАГРУЗКИ (High Load)", "SYSTEM")
         kill_process_by_name("xray")
         manage_cache_lifecycle()
 
         total_candidates = []
         if os.path.exists(TEMP_POOL_FILE):
-            log_event("♻️ Загрузка из Снапшота...")
+            log_event("♻️ Восстановление из снапшота...", "SNAPSHOT")
             with open(TEMP_POOL_FILE, "r") as f: total_candidates = json.load(f)
 
         if not total_candidates:
             if not os.path.exists(RAW_LINKS_FILE): 
-                log_event("❌ RAW_LINKS_FILE не найден.")
+                log_event("❌ Файл raw_links.txt не найден.", "CRITICAL")
                 return
             
-            with open(RAW_LINKS_FILE, "r") as f: content = f.read()
-            # Extract subscription URLs (http links)
+            with open(RAW_LINKS_FILE, "r") as f: 
+                content = f.read()
+            
+            # Извлекаем ссылки на подписки и прямые конфиги
             sub_urls = [l.strip() for l in content.split() if l.strip().startswith('http')]
+            raw_configs = extract_configs_from_text(content)
             
-            log_event(f"🌐 Сбор подписок: {len(sub_urls)} URL...")
-            fetched = await fetch_external_subs(sub_urls)
+            log_event(f"🌍 Загрузка {len(sub_urls)} подписок...", "NET")
+            fetched_configs = await fetch_external_subs(sub_urls)
             
-            # Combine raw links from file + fetched links
-            pool = list(set(extract_configs_from_text(content) + fetched))
+            combined_pool = list(set(raw_configs + fetched_configs))
+            log_event(f"🧬 Всего уникальных ссылок после парсинга: {len(combined_pool)}", "DATA")
             
+            # Глубокая фильтрация (MD5 + IP:Port)
             existing_hashes = set()
             for rf in RESULT_FILES:
                 if os.path.exists(rf):
                     with open(rf, "r") as f:
-                        for line in f: 
+                        for line in f:
                             h = get_md5(line)
                             if h: existing_hashes.add(h)
             
             seen_ips = set()
-            for link in pool:
+            for link in combined_pool:
                 l_md5 = get_md5(link)
                 l_ip = extract_server_identity(link)
                 if l_md5 not in existing_hashes and l_ip not in seen_ips:
                     total_candidates.append(link)
                     seen_ips.add(l_ip)
             
+            log_event(f"🎯 Отобрано для тестирования: {len(total_candidates)} (отсеяно дублей: {len(combined_pool)-len(total_candidates)})", "DATA")
             random.shuffle(total_candidates)
             with open(TEMP_POOL_FILE, "w") as f: json.dump(total_candidates, f)
 
+        # Синхронизация с базой мертвых нод
         dead_cache = set()
         if os.path.exists(DEAD_CACHE_FILE):
-            with open(DEAD_CACHE_FILE, "r") as f: dead_cache = {l.strip() for l in f}
+            with open(DEAD_CACHE_FILE, "r") as f: 
+                dead_cache = {l.strip() for l in f}
 
-        fresh = [l for l in total_candidates if get_md5(l) not in dead_cache]
-        log_event(f"🔍 К ПРОВЕРКЕ: {len(fresh)}")
+        fresh_nodes = [l for l in total_candidates if get_md5(l) not in dead_cache]
+        stats["total"] = len(fresh_nodes)
+        
+        log_event(f"🏁 Начинаем аудит {stats['total']} нод...", "SYSTEM")
 
-        if not fresh:
+        if not fresh_nodes:
             if os.path.exists(TEMP_POOL_FILE): os.remove(TEMP_POOL_FILE)
-            log_event("✅ Новых нод нет.")
+            log_event("✅ Новых нод для проверки не найдено.", "SYSTEM")
             return
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
         
-        # Testing in smaller batches for responsiveness
-        for i in range(0, len(fresh), BATCH_SIZE):
-            batch = fresh[i : i + BATCH_SIZE]
-            tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
+        # Основной цикл обработки батчами
+        for i in range(0, len(fresh_nodes), BATCH_SIZE):
+            batch = fresh_nodes[i : i + BATCH_SIZE]
+            
+            # Динамическое распределение портов
+            tasks = []
+            for idx, link in enumerate(batch):
+                port = BASE_PORT + (idx % PORT_RANGE)
+                tasks.append(audit_single_link(link, port, semaphore))
+            
             results = await asyncio.gather(*tasks)
             
+            # Запись результатов
             async with file_lock:
                 for link, cat, speed in results:
                     if cat == "ALREADY_DONE": continue
@@ -504,11 +528,13 @@ async def main_orchestrator():
                         if target:
                             with open(target, "a") as f: f.write(f"{link}\n")
             
-            # Atomic progress save
-            remaining = fresh[i+BATCH_SIZE:]
+            # Сохранение прогресса
+            remaining = fresh_nodes[i + BATCH_SIZE:]
             with open(TEMP_POOL_FILE, "w") as f: json.dump(remaining, f)
+            
+            log_event(f"Промежуточные итоги: Elite: {stats['elite']}, Stable: {stats['stable']}, Dead: {stats['dead']}", "STATS")
 
-        log_event("🏁 ФИНИШ. Все ноды обработаны.")
+        log_event(f"🏆 ОБРАБОТКА ЗАВЕРШЕНА. Результаты: Elite: {stats['elite']}, Stable: {stats['stable']}, Fast: {stats['fast']}", "SYSTEM")
         if os.path.exists(TEMP_POOL_FILE): os.remove(TEMP_POOL_FILE)
 
     finally:
@@ -519,7 +545,7 @@ if __name__ == "__main__":
         asyncio.run(main_orchestrator())
     except (SystemExit, KeyboardInterrupt): pass
     except Exception as e:
-        log_event(f"🔴 CRASH: {e}")
+        log_event(f"💥 КРИТИЧЕСКИЙ СБОЙ: {e}", "CRASH")
         if os.path.exists(LOCK_FILE): 
             try: os.remove(LOCK_FILE)
             except: pass
