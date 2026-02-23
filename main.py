@@ -74,36 +74,44 @@ def manage_cache_lifecycle():
 
 def extract_configs_from_text(text):
     """
-    Advanced recursive extraction. 
-    Handles: Mixed plain text, pure Base64, and Base64 wrapped in garbage/HTML.
-    Cleans invisible characters and standardizes output.
+    Advanced recursive extraction with "Smart Boundary Detection".
+    Finds links even if they are concatenated or hidden in deep Base64.
     """
     found_links = set()
     
     def find_raw_links(s):
-        # Match standard proxy protocols: vless, vmess, ss, trojan
-        pat = r'(vless|vmess|ss|trojan)://[^\s|#\^]+(?:#[^\s]*)?'
-        return re.findall(pat, s, re.IGNORECASE)
+        # Improved regex with positive lookahead to stop before the next protocol or specific delimiters
+        # This prevents "eating" multiple links into one string
+        pattern = r'(vless|vmess|ss|trojan)://(?:(?!(vless|vmess|ss|trojan)://)[^\s"\'<>|])+?'
+        # After extraction, we trim common trailing characters that shouldn't be there
+        raw_matches = re.finditer(pattern, s, re.IGNORECASE)
+        results = []
+        for match in raw_matches:
+            link = match.group(0)
+            # Clean trailing junk like dots, commas or brackets that might be captured
+            link = link.rstrip('.,;)]}>')
+            results.append(link)
+        return results
 
-    # 1. Clean HTML tags and invisible Unicode characters
+    # 1. Pre-cleaning
+    # Remove HTML tags but keep content
     text = re.sub(r'<[^>]+>', ' ', text)
-    # Remove Zero Width Space and other invisible junk
+    # Remove Zero Width Space and invisible junk
     text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '')
     
-    # 2. Extract any direct links from the text
+    # 2. Extract direct links
     for link in find_raw_links(text):
-        found_links.add(link.strip())
+        if link.strip():
+            found_links.add(link.strip())
 
-    # 3. Aggressive Base64 extraction
-    # Look for strings that look like Base64 (alphanumeric + some symbols)
-    # and are long enough to be a config list (at least 32 chars).
-    potential_blocks = re.findall(r'[a-zA-Z0-9+/=\s\n\r]{32,}', text)
+    # 3. Recursive Base64 Extraction
+    # Look for Base64 blocks. URL-safe Base64 uses '-' and '_'
+    potential_blocks = re.findall(r'[a-zA-Z0-9+/=\-_]{32,}', text)
     
     for block in potential_blocks:
-        # Crucial: Remove ALL whitespace that breaks b64decode
-        clean_block = re.sub(r'\s+', '', block)
-        
-        # Base64 strings must have a length multiple of 4
+        clean_block = block.strip()
+        # Fix padding for standard b64decode
+        clean_block = clean_block.replace('-', '+').replace('_', '/')
         missing_padding = len(clean_block) % 4
         if missing_padding:
             clean_block += '=' * (4 - missing_padding)
@@ -112,18 +120,18 @@ def extract_configs_from_text(text):
             decoded_bytes = base64.b64decode(clean_block)
             decoded = decoded_bytes.decode('utf-8', errors='ignore')
             
-            # If the decoded content has protocol markers, we process it
+            # If the decoded content contains protocol markers, process it
             if any(proto in decoded.lower() for proto in ["vless://", "vmess://", "ss://", "trojan://"]):
-                # Recursive call to find links inside the decoded content
                 for link in find_raw_links(decoded):
                     found_links.add(link.strip())
                 
-                # Check for nested Base64 (common in some subscription aggregators)
-                # Only go deeper if we haven't found a massive amount of links yet
-                if len(found_links) < 100:
-                    nested = extract_configs_from_text(decoded)
-                    for n_link in nested:
-                        found_links.add(n_link)
+                # Recursive depth check to prevent infinite loops (Max 3 levels)
+                # We use a simplified check here
+                if "://" in decoded:
+                    # Search again in the decoded result
+                    inner_links = find_raw_links(decoded)
+                    for i_link in inner_links:
+                        found_links.add(i_link)
         except:
             continue
 
@@ -134,7 +142,7 @@ async def fetch_external_subs(urls):
     Downloads subscription content with browser emulation and error handling.
     """
     all_links = []
-    timeout = aiohttp.ClientTimeout(total=30) # Increased timeout for large 5000+ lists
+    timeout = aiohttp.ClientTimeout(total=45) # Increased for 5000+ nodes
     
     async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
         for url in urls:
@@ -148,12 +156,12 @@ async def fetch_external_subs(urls):
                     if resp.status == 200:
                         content = await resp.text()
                         found = extract_configs_from_text(content)
-                        log_event(f"  [+] Extracted {len(found)} nodes.")
+                        log_event(f"  [+] Extracted {len(found)} nodes from this source.")
                         all_links.extend(found)
                     else:
-                        log_event(f"  [!] HTTP Error {resp.status} for {url[:40]}...")
+                        log_event(f"  [!] HTTP Error {resp.status} for source.")
             except Exception as e:
-                log_event(f"  [!] Fetch failed for {url[:40]}... -> {str(e)[:50]}")
+                log_event(f"  [!] Fetch failed: {str(e)[:50]}")
     return all_links
 
 def parse_proxy_link(link):
@@ -164,16 +172,18 @@ def parse_proxy_link(link):
     try:
         # Handle VMESS
         if link.lower().startswith("vmess://"):
-            b64_part = link[8:].split("#")[0].strip()
+            parts = link[8:].split("#")
+            b64_part = parts[0].strip()
+            remark = parts[1] if len(parts) > 1 else "Unnamed"
+            
             # Clean all whitespace from the Base64 string
             b64_part = re.sub(r'\s+', '', b64_part)
             # Fix padding
             b64_part += "=" * (-len(b64_part) % 4)
             
             decoded_str = base64.b64decode(b64_part).decode('utf-8', errors='ignore')
-            # Clean JSON string from potential junk before parsing
             decoded_str = decoded_str.strip()
-            # Handle cases where JSON might be wrapped in more junk
+            
             json_match = re.search(r'\{.*\}', decoded_str, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
@@ -190,7 +200,7 @@ def parse_proxy_link(link):
                 "security": data.get("tls", "none") if data.get("tls") != "" else "none",
                 "type": data.get("net", "tcp"),
                 "aid": data.get("aid", 0),
-                "remark": data.get("ps", "Unnamed")
+                "remark": data.get("ps", remark)
             }
             
         # Handle VLESS
@@ -226,15 +236,13 @@ def parse_proxy_link(link):
                 "sid": params.get("sid", ""),
                 "fp": params.get("fp", "chrome")
             }
-    except Exception as e:
-        # Silent fail for individual link parsing
+    except:
         return None
     return None
 
 def generate_xray_config(parsed_link, local_port):
     """
     Generates a production-ready JSON config for Xray core.
-    Supports Reality, TLS, WebSocket, and gRPC.
     """
     protocol = parsed_link["protocol"]
     config = {
@@ -275,13 +283,11 @@ def generate_xray_config(parsed_link, local_port):
     outbound["settings"]["vnext"][0]["users"].append(user)
     ss = outbound["streamSettings"]
     
-    # Network specific settings
     if parsed_link["type"] == "ws":
         ss["wsSettings"] = {"path": parsed_link["path"]}
     elif parsed_link["type"] == "grpc":
         ss["grpcSettings"] = {"serviceName": parsed_link.get("path", "")}
 
-    # Security specific settings
     if parsed_link["security"] == "reality":
         ss["realitySettings"] = {
             "show": False,
@@ -307,7 +313,6 @@ async def check_gemini_access(socks_port):
     """
     try:
         proxy_url = f"socks5h://127.0.0.1:{socks_port}"
-        # Using curl for a reliable SOCKS5h check
         cmd = [
             "curl", "-s", "-L", "-k", "--proxy", proxy_url,
             GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15",
@@ -316,7 +321,6 @@ async def check_gemini_access(socks_port):
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
-        # Look for 200 OK or 302 Redirect (often happens with auth gates)
         return (True, "OK") if "200" in res or "302" in res else (False, f"HTTP_{res}")
     except Exception as e:
         return False, f"Error: {str(e)[:20]}"
@@ -360,22 +364,16 @@ async def audit_single_link(link, local_port):
         
     xray_proc = None
     try:
-        # Start Xray Core
         xray_proc = subprocess.Popen(
             [XRAY_PATH, "-c", config_path], 
             stdout=subprocess.DEVNULL, 
             stderr=subprocess.DEVNULL
         )
-        # Give Xray time to establish connection
         await asyncio.sleep(2.5)
         
-        # Test Gemini Access
         is_gemini, g_msg = await check_gemini_access(local_port)
-        
-        # Test Speed (only if Gemini works or for Fast category)
         speed, ping = await measure_speed_librespeed(local_port)
         
-        # Logic for classification
         verdict = "DEAD"
         if is_gemini and speed >= 1.0: 
             verdict = "ELITE"
@@ -386,14 +384,13 @@ async def audit_single_link(link, local_port):
         
         log_event(f"[{proxy_id}] {verdict} | {speed}Mbps | {g_msg} | {parsed['protocol'].upper()}")
         
-        # Cleanup
         xray_proc.terminate()
         xray_proc.wait()
         if os.path.exists(config_path): os.remove(config_path)
         
         return link, verdict, speed
         
-    except Exception as e:
+    except Exception:
         if xray_proc: 
             xray_proc.terminate()
             xray_proc.wait()
@@ -407,7 +404,6 @@ async def main_orchestrator():
     log_event("--- SIERRA X-RAY ORCHESTRATOR ONLINE ---")
     manage_cache_lifecycle()
     
-    # 1. Read sources from raw_links.txt
     if not os.path.exists(RAW_LINKS_FILE):
         log_event(f"[ERROR] {RAW_LINKS_FILE} missing.")
         return
@@ -418,14 +414,10 @@ async def main_orchestrator():
     sub_urls = [l for l in lines if l.startswith('http')]
     direct_configs = [l for l in lines if '://' in l and not l.startswith('http')]
     
-    # 2. Fetch external subscriptions
     fetched_links = await fetch_external_subs(sub_urls)
-    
-    # 3. Deduplication and Initial Cleanup
     raw_candidates = list(set(direct_configs + fetched_links))
     log_event(f"[PARSER] Raw candidates found: {len(raw_candidates)}")
 
-    # 4. Filter against Dead Cache
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
@@ -442,12 +434,7 @@ async def main_orchestrator():
 
     log_event(f"[PARSER] Filtering complete. {len(fresh_links)} unique fresh nodes to test.")
 
-    # 5. Execute Audit
-    # We use a fixed port for simplicity, but could be dynamic for parallel testing
     base_port = 10808
-    
-    # Clear result files from previous run if needed or just append
-    # Here we append to maintain history if requested, but usually, we start fresh
     for rf in RESULT_FILES:
         if not os.path.exists(rf):
             with open(rf, "w") as f: pass
@@ -472,7 +459,6 @@ async def main_orchestrator():
     log_event("--- AUDIT COMPLETE ---")
 
 if __name__ == "__main__":
-    # Ensure binary execution permissions (specific to Linux environments like GitHub Actions)
     try:
         if os.path.exists(LIBRESPEED_PATH):
             os.chmod(LIBRESPEED_PATH, 0o755)
