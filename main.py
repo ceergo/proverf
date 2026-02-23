@@ -67,13 +67,13 @@ def manage_cache_lifecycle():
             try:
                 last_run = datetime.fromisoformat(f.read().strip())
                 if now - last_run > timedelta(hours=72):
-                    log_event("[CLEANUP] 72h cycle reached! Wiping dead_cache...")
+                    log_event("🧹 Цикл 72 часа: Очищаем базу мертвых ссылок...")
                     if os.path.exists(DEAD_CACHE_FILE): 
                         os.remove(DEAD_CACHE_FILE)
                     with open(CLEANUP_LOG, "w") as f_out: 
                         f_out.write(now.isoformat())
-            except Exception as e:
-                log_event(f"[CLEANUP ERROR] {e}")
+            except Exception:
+                pass
     else:
         with open(CLEANUP_LOG, "w") as f_out: 
             f_out.write(now.isoformat())
@@ -90,7 +90,6 @@ def extract_server_identity(node_string):
 def extract_configs_from_text(text):
     """
     Linear Logic: Finds protocols and captures until whitespace or special char.
-    No recursive Base64 to avoid ghost links.
     """
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
     text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ')
@@ -123,16 +122,14 @@ async def fetch_external_subs(urls):
         for url in urls:
             url = url.strip()
             if not url.startswith('http'): continue
-            log_event(f"[FETCH] Источник: {url}")
             try:
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.text()
                         found = extract_configs_from_text(content)
-                        log_event(f"  [+] Найдено нод: {len(found)}")
                         all_links.extend(found)
-            except Exception as e:
-                log_event(f"  [!] Ошибка загрузки: {str(e)[:40]}")
+            except Exception:
+                pass
     return all_links
 
 def parse_proxy_link(link):
@@ -231,7 +228,7 @@ def generate_xray_config(parsed_link, local_port):
 
 async def check_gemini_access(socks_port):
     """
-    Check Gemini and handle 403 gracefully without dumping HTML.
+    Check Gemini and handle codes.
     """
     try:
         cmd = ["curl", "-s", "-L", "-k", "--proxy", f"socks5h://127.0.0.1:{socks_port}", GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15", "-w", "%{http_code}"]
@@ -239,14 +236,14 @@ async def check_gemini_access(socks_port):
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
         
-        if "200" in res or "302" in res: return True, "OK"
-        if "403" in res: return False, "403 (Blocked)"
-        return False, f"Code_{res[:3]}"
-    except: return False, "Err"
+        if "200" in res or "302" in res: return True, "ДОСТУПНО ✅"
+        if "403" in res: return False, "БЛОК 🛑"
+        return False, f"ОТВЕТ: {res[:3]}"
+    except: return False, "ОШИБКА ❌"
 
 async def measure_speed_librespeed(socks_port):
     """
-    Speed test with 12s duration for better latching.
+    Speed test with longer duration for stability.
     """
     try:
         cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "12"]
@@ -260,14 +257,17 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Full audit cycle with detailed link logging.
+    Full audit cycle with FULL LINK logging.
     """
     async with semaphore:
         proxy_id = get_md5(link)[:6]
-        log_event(f"[*] ПРОВЕРКА [{proxy_id}]: {link[:70]}...")
+        # Прямо выводим всю ссылку, чтобы Босс мог её забрать
+        print(f"\n🚀 ТЕСТИРУЮ: {link}", flush=True)
         
         parsed = parse_proxy_link(link)
-        if not parsed: return link, "DEAD", 0
+        if not parsed: 
+            print(f"  └─ ❌ ОШИБКА ПАРСИНГА (Битая ссылка)", flush=True)
+            return link, "DEAD", 0
         
         config_path = f"cfg_{proxy_id}_{local_port}.json"
         with open(config_path, "w") as f: json.dump(generate_xray_config(parsed, local_port), f)
@@ -280,14 +280,28 @@ async def audit_single_link(link, local_port, semaphore):
             is_gemini, g_msg = await check_gemini_access(local_port)
             speed, ping = await measure_speed_librespeed(local_port)
             
-            verdict = "DEAD"
-            if is_gemini and speed >= 0.8: verdict = "ELITE"
-            elif is_gemini: verdict = "STABLE"
-            elif speed >= 1.5: verdict = "FAST_NO_GOOGLE"
+            verdict = "МЕРТВАЯ 💀"
+            emoji = "💀"
+            if is_gemini and speed >= 0.8: 
+                verdict = "ELITE ⭐"
+                emoji = "⭐"
+            elif is_gemini: 
+                verdict = "STABLE 🟢"
+                emoji = "🟢"
+            elif speed >= 1.5: 
+                verdict = "FAST (No Google) ⚡"
+                emoji = "⚡"
             
-            log_event(f"  [ИТОГ] {verdict} | {speed}Mbps | Gemini: {g_msg}")
-            return link, verdict, speed
-        except: return link, "DEAD", 0
+            print(f"  └─ {emoji} СТАТУС: {verdict} | СКОРОСТЬ: {speed} Mbps | GEMINI: {g_msg}", flush=True)
+            
+            final_cat = "DEAD"
+            if "ELITE" in verdict: final_cat = "ELITE"
+            elif "STABLE" in verdict: final_cat = "STABLE"
+            elif "FAST" in verdict: final_cat = "FAST_NO_GOOGLE"
+            
+            return link, final_cat, speed
+        except: 
+            return link, "DEAD", 0
         finally:
             if xray_proc:
                 xray_proc.kill()
@@ -296,27 +310,26 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Orchestrator with summary logging.
+    Main engine with human-readable logs.
     """
-    log_event("--- SIERRA LINEAR MASTER ONLINE ---")
+    log_event("⚡ СИСТЕМА SIERRA ЗАПУЩЕНА (ЛИНЕЙНЫЙ РЕЖИМ) ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
-        log_event(f"[!] Файл {RAW_LINKS_FILE} не найден.")
+        print(f"❌ Файл {RAW_LINKS_FILE} не найден. Нечего проверять.")
         return
 
     with open(RAW_LINKS_FILE, "r") as f:
         content = f.read()
     
-    # Simple direct extract
     raw_found = extract_configs_from_text(content)
-    
-    # Sub extract
     sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
+    
+    print(f"🔗 Проверяю {len(sub_urls)} ссылок на подписки...", flush=True)
     fetched = await fetch_external_subs(sub_urls)
     
     all_candidates = list(set(raw_found + fetched))
-    log_event(f"[SYSTEM] ВСЕГО ОБНАРУЖЕНО УНИКАЛЬНЫХ НОД: {len(all_candidates)}")
+    print(f"\n💎 ВСЕГО НАЙДЕНО: {len(all_candidates)} уникальных ссылок", flush=True)
 
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
@@ -324,7 +337,7 @@ async def main_orchestrator():
             dead_cache = {l.strip() for l in f if l.strip()}
 
     fresh = [l for l in all_candidates if get_md5(l) not in dead_cache]
-    log_event(f"[SYSTEM] Новых нод для теста: {len(fresh)} (Пропущено {len(all_candidates)-len(fresh)} из кэша)")
+    print(f"🆕 К проверке: {len(fresh)} нод (остальные уже в черном списке)\n", flush=True)
 
     for rf in RESULT_FILES:
         if not os.path.exists(rf): open(rf, "w").close()
@@ -332,7 +345,7 @@ async def main_orchestrator():
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
     for i in range(0, len(fresh), BATCH_SIZE):
         batch = fresh[i : i + BATCH_SIZE]
-        log_event(f"--- ПАЧКА {i//BATCH_SIZE + 1} ({i+1}-{min(i+BATCH_SIZE, len(fresh))}) ---")
+        log_event(f"📦 ОБРАБОТКА ПАЧКИ #{i//BATCH_SIZE + 1}...")
         tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
         results = await asyncio.gather(*tasks)
         
@@ -343,9 +356,9 @@ async def main_orchestrator():
                 target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
                 if target:
                     with open(target, "a") as f:
-                        f.write(f"{link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
+                        f.write(f"{link}\n")
 
-    log_event("--- АУДИТ SIERRA ЗАВЕРШЕН ---")
+    print(f"\n✅ АУДИТ ЗАВЕРШЕН. РЕЗУЛЬТАТЫ В ФАЙЛАХ.")
 
 if __name__ == "__main__":
     asyncio.run(main_orchestrator())
