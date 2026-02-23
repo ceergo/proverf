@@ -33,9 +33,9 @@ LIBRESPEED_PATH = "./librespeed-cli"
 GEMINI_CHECK_URL = "https://aistudio.google.com/app"
 
 # Concurrency & Networking
-MAX_CONCURRENT_TESTS = 5  # Number of parallel Xray instances
-BATCH_SIZE = 10           # Process nodes in batches
-BASE_PORT = 10800         # Starting port for local SOCKS5 proxies
+MAX_CONCURRENT_TESTS = 5  
+BATCH_SIZE = 10           
+BASE_PORT = 10800         
 
 # Browser Emulation Headers
 HEADERS = {
@@ -89,28 +89,21 @@ def extract_server_identity(node_string):
 
 def extract_configs_from_text(text):
     """
-    Simplified Linear Logic:
-    Finds keywords (vless://, etc.) and captures until whitespace or special char.
-    No more recursive Base64 'matryoshka' to avoid duplicate/phantom links.
+    Linear Logic: Finds protocols and captures until whitespace or special char.
+    No recursive Base64 to avoid ghost links.
     """
-    # Look for known protocols and capture everything until a break character
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
-    
-    # Pre-clean: replace common separators with spaces
     text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ')
     
     found_raw = []
     matches = re.finditer(pattern, text, re.IGNORECASE)
     for m in matches:
         link = m.group(0).rstrip('.,;)]}>')
-        # Basic validation: must have @ or be vmess b64
         if '@' in link or link.startswith('vmess://'):
             found_raw.append(link)
 
-    # Basic Base64 decoding ONLY for the whole block (Standard subscription format)
     if not found_raw and len(text.strip()) > 50:
         try:
-            # Try to decode the entire text as one big B64 block
             padded = text.strip() + "=" * (-len(text.strip()) % 4)
             decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
             if any(p in decoded.lower() for p in ['vless://', 'vmess://', 'trojan://']):
@@ -130,16 +123,16 @@ async def fetch_external_subs(urls):
         for url in urls:
             url = url.strip()
             if not url.startswith('http'): continue
-            log_event(f"[FETCH] Source: {url}")
+            log_event(f"[FETCH] Источник: {url}")
             try:
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.text()
                         found = extract_configs_from_text(content)
-                        log_event(f"  [+] Found {len(found)} nodes.")
+                        log_event(f"  [+] Найдено нод: {len(found)}")
                         all_links.extend(found)
             except Exception as e:
-                log_event(f"  [!] Fetch failed: {str(e)[:40]}")
+                log_event(f"  [!] Ошибка загрузки: {str(e)[:40]}")
     return all_links
 
 def parse_proxy_link(link):
@@ -188,29 +181,32 @@ def parse_proxy_link(link):
 
 def generate_xray_config(parsed_link, local_port):
     """
-    Generates Xray config WITH DNS fix for Librespeed 0.0Mbps issue.
+    Xray config with ADVANCED DNS for Librespeed.
     """
     protocol = parsed_link["protocol"]
     config = {
         "log": {"loglevel": "none"},
         "dns": {
-            "servers": ["8.8.8.8", "1.1.1.1", "localhost"]
+            "servers": ["8.8.8.8", "1.1.1.1", "localhost"],
+            "queryStrategy": "UseIPv4"
         },
         "routing": {
             "domainStrategy": "AsIs",
-            "rules": [{"type": "field", "outboundTag": "proxy", "network": "udp,tcp"}]
+            "rules": [
+                {"type": "field", "outboundTag": "proxy", "network": "udp,tcp"},
+                {"type": "field", "outboundTag": "direct", "domain": ["localhost"]}
+            ]
         },
         "inbounds": [{
             "port": local_port, "protocol": "socks",
             "settings": {"auth": "noauth", "udp": True},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         }],
-        "outbounds": []
+        "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {}}]
     }
 
-    # Outbound construction (simplified)
     if protocol == "hy2":
-        out = {"protocol": "hysteria2", "settings": {"server": parsed_link["host"], "port": parsed_link["port"], "auth": parsed_link["uuid"]},
+        out = {"tag": "proxy", "protocol": "hysteria2", "settings": {"server": parsed_link["host"], "port": parsed_link["port"], "auth": parsed_link["uuid"]},
                "streamSettings": {"network": "udp", "security": "tls", "tlsSettings": {"serverName": parsed_link.get("sni", parsed_link["host"]), "allowInsecure": True}}}
     else:
         out = {"tag": "proxy", "protocol": protocol, "settings": {}, "streamSettings": {"network": parsed_link.get("type", "tcp"), "security": parsed_link.get("security", "none")}}
@@ -230,27 +226,30 @@ def generate_xray_config(parsed_link, local_port):
         elif ss["security"] == "tls":
             ss["tlsSettings"] = {"serverName": parsed_link.get("sni", ""), "allowInsecure": True}
 
-    config["outbounds"].append(out)
+    config["outbounds"].insert(0, out)
     return config
 
 async def check_gemini_access(socks_port):
     """
-    Check if Google Gemini is accessible.
+    Check Gemini and handle 403 gracefully without dumping HTML.
     """
     try:
         cmd = ["curl", "-s", "-L", "-k", "--proxy", f"socks5h://127.0.0.1:{socks_port}", GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15", "-w", "%{http_code}"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
-        return (True, "OK") if "200" in res or "302" in res else (False, f"HTTP_{res}")
+        
+        if "200" in res or "302" in res: return True, "OK"
+        if "403" in res: return False, "403 (Blocked)"
+        return False, f"Code_{res[:3]}"
     except: return False, "Err"
 
 async def measure_speed_librespeed(socks_port):
     """
-    Measures speed with increased duration (10s) for better accuracy.
+    Speed test with 12s duration for better latching.
     """
     try:
-        cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "10"]
+        cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "12"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         if proc.returncode == 0:
@@ -261,12 +260,11 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Cycles through one node with FULL LOGGING of the link being tested.
+    Full audit cycle with detailed link logging.
     """
     async with semaphore:
         proxy_id = get_md5(link)[:6]
-        # LOGGING LINK FOR THE BOSS
-        log_event(f"[*] TESTING [{proxy_id}]: {link[:60]}...")
+        log_event(f"[*] ПРОВЕРКА [{proxy_id}]: {link[:70]}...")
         
         parsed = parse_proxy_link(link)
         if not parsed: return link, "DEAD", 0
@@ -277,7 +275,7 @@ async def audit_single_link(link, local_port, semaphore):
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(4.0)
+            await asyncio.sleep(4.5)
             
             is_gemini, g_msg = await check_gemini_access(local_port)
             speed, ping = await measure_speed_librespeed(local_port)
@@ -285,9 +283,9 @@ async def audit_single_link(link, local_port, semaphore):
             verdict = "DEAD"
             if is_gemini and speed >= 0.8: verdict = "ELITE"
             elif is_gemini: verdict = "STABLE"
-            elif speed >= 2.0: verdict = "FAST_NO_GOOGLE"
+            elif speed >= 1.5: verdict = "FAST_NO_GOOGLE"
             
-            log_event(f"  [RESULT] {verdict} | {speed}Mbps | {g_msg}")
+            log_event(f"  [ИТОГ] {verdict} | {speed}Mbps | Gemini: {g_msg}")
             return link, verdict, speed
         except: return link, "DEAD", 0
         finally:
@@ -298,35 +296,35 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main engine: simplifies link finding and runs batches.
+    Orchestrator with summary logging.
     """
-    log_event("--- SIERRA LINEAR MODE ONLINE ---")
+    log_event("--- SIERRA LINEAR MASTER ONLINE ---")
     manage_cache_lifecycle()
     
-    if not os.path.exists(RAW_LINKS_FILE): return
+    if not os.path.exists(RAW_LINKS_FILE): 
+        log_event(f"[!] Файл {RAW_LINKS_FILE} не найден.")
+        return
 
     with open(RAW_LINKS_FILE, "r") as f:
         content = f.read()
     
-    # 1. Simple search for direct links
+    # Simple direct extract
     raw_found = extract_configs_from_text(content)
     
-    # 2. Search in external subs
+    # Sub extract
     sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
     fetched = await fetch_external_subs(sub_urls)
     
-    # 3. Combine and Deduplicate
     all_candidates = list(set(raw_found + fetched))
-    log_event(f"[SYSTEM] Total unique nodes discovered: {len(all_candidates)}")
+    log_event(f"[SYSTEM] ВСЕГО ОБНАРУЖЕНО УНИКАЛЬНЫХ НОД: {len(all_candidates)}")
 
-    # 4. Filter Dead Cache
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             dead_cache = {l.strip() for l in f if l.strip()}
 
     fresh = [l for l in all_candidates if get_md5(l) not in dead_cache]
-    log_event(f"[SYSTEM] Fresh nodes to test: {len(fresh)}")
+    log_event(f"[SYSTEM] Новых нод для теста: {len(fresh)} (Пропущено {len(all_candidates)-len(fresh)} из кэша)")
 
     for rf in RESULT_FILES:
         if not os.path.exists(rf): open(rf, "w").close()
@@ -334,7 +332,7 @@ async def main_orchestrator():
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
     for i in range(0, len(fresh), BATCH_SIZE):
         batch = fresh[i : i + BATCH_SIZE]
-        log_event(f"--- BATCH {i//BATCH_SIZE + 1} START ---")
+        log_event(f"--- ПАЧКА {i//BATCH_SIZE + 1} ({i+1}-{min(i+BATCH_SIZE, len(fresh))}) ---")
         tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
         results = await asyncio.gather(*tasks)
         
@@ -345,9 +343,9 @@ async def main_orchestrator():
                 target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
                 if target:
                     with open(target, "a") as f:
-                        f.write(f"{link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m')}\n")
+                        f.write(f"{link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
 
-    log_event("--- SIERRA AUDIT FINISHED ---")
+    log_event("--- АУДИТ SIERRA ЗАВЕРШЕН ---")
 
 if __name__ == "__main__":
     asyncio.run(main_orchestrator())
