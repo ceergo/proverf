@@ -31,6 +31,13 @@ LIBRESPEED_PATH = "./librespeed-cli"
 # Critical Links
 GEMINI_CHECK_URL = "https://aistudio.google.com/app"
 
+# Browser Emulation Headers
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
 def log_event(msg):
     """Real-time logging for GitHub Actions."""
     timestamp = datetime.now().strftime('%H:%M:%S')
@@ -54,51 +61,70 @@ def manage_cache_lifecycle():
         with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
 
 def extract_configs_from_text(text):
-    """Extracts proxy links and handles Base64 decoding if necessary."""
+    """Deep extraction of proxy links from raw or Base64 encoded text."""
     results = []
     
-    # Try decoding as a whole block first
+    # Clean the input text from common garbage
+    text = text.strip()
+    
+    # Helper to find protocol links in any string
+    def find_links(s):
+        pat = r'(vless|vmess|ss|trojan)://[^\s|#\^]+(?:#[^\s]*)?'
+        return re.findall(pat, s, re.IGNORECASE)
+
+    # 1. Try to find links directly (unencoded content)
+    results.extend(find_links(text))
+
+    # 2. Try to decode as a whole block (Aggressive Base64 cleaning)
+    # Remove newlines, spaces, and potential URL-safe characters before decoding
+    cleaned_b64 = re.sub(r'[^a-zA-Z0-9+/=]', '', text)
     try:
-        decoded = base64.b64decode(text.strip()).decode('utf-8', errors='ignore')
+        decoded = base64.b64decode(cleaned_b64 + "===").decode('utf-8', errors='ignore')
         if "://" in decoded:
-            text = decoded
+            results.extend(find_links(decoded))
     except:
         pass
-        
-    pattern = r'(vless|vmess|ss|trojan)://[^\s|#\^]+(?:#[^\s]*)?'
-    found = re.findall(pattern, text, re.IGNORECASE)
-    results.extend(found)
     
+    # 3. If direct links are few, try finding Base64-like substrings (for mixed content)
+    if len(results) < 5:
+        # Search for long alphanumeric strings that could be Base64
+        potential_b64_blocks = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
+        for block in potential_b64_blocks:
+            try:
+                dec = base64.b64decode(block + "===").decode('utf-8', errors='ignore')
+                results.extend(find_links(dec))
+            except:
+                continue
+
     return list(set(results))
 
 async def fetch_external_subs(urls):
-    """Downloads content from external subscription URLs."""
+    """Downloads content from external subscription URLs with browser emulation."""
     all_links = []
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
         for url in urls:
             url = url.strip()
             if not url.startswith('http'): continue
-            log_event(f"[FETCH] Downloading subscription: {url}")
+            log_event(f"[FETCH] Downloading: {url}")
             try:
-                async with session.get(url, timeout=15) as resp:
+                # Use allow_redirects=True to handle URL shorteners/gateways
+                async with session.get(url, timeout=20, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.text()
                         found = extract_configs_from_text(content)
-                        log_event(f"  [+] Found {len(found)} nodes in sub.")
+                        log_event(f"  [+] Extracted {len(found)} nodes.")
                         all_links.extend(found)
                     else:
-                        log_event(f"  [!] Sub returned status {resp.status}")
+                        log_event(f"  [!] HTTP Error {resp.status} for {url[:30]}...")
             except Exception as e:
-                log_event(f"  [!] Failed to fetch sub: {e}")
+                log_event(f"  [!] Fetch failed: {str(e)[:50]}")
     return all_links
 
 def parse_proxy_link(link):
     """Advanced parser for VLESS and VMESS protocols."""
     try:
         if link.startswith("vmess://"):
-            # VMESS is usually base64 encoded JSON
             b64_data = link.replace("vmess://", "").split("#")[0]
-            # Fix padding if needed
             b64_data += "=" * (-len(b64_data) % 4)
             data = json.loads(base64.b64decode(b64_data).decode('utf-8'))
             return {
@@ -119,11 +145,9 @@ def parse_proxy_link(link):
             netloc = parsed.netloc
             if "@" not in netloc: return None
             
-            # Extract User Info and Host/Port
             user_info, host_port = netloc.split("@")
             uuid = user_info
             
-            # Handle cases with or without explicit port
             if ":" in host_port:
                 host, port = host_port.split(":")
                 port = int(port)
@@ -131,7 +155,6 @@ def parse_proxy_link(link):
                 host = host_port
                 port = 443
             
-            # Parse Query Params
             params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
             
             return {
@@ -148,15 +171,13 @@ def parse_proxy_link(link):
                 "sid": params.get("sid", ""),
                 "fp": params.get("fp", "chrome")
             }
-    except Exception as e:
+    except Exception:
         return None
     return None
 
 def generate_xray_config(parsed_link, local_port):
     """Generates a specialized JSON config for Xray based on protocol and security."""
     protocol = parsed_link["protocol"]
-    
-    # Base configuration
     config = {
         "log": {"loglevel": "none"},
         "inbounds": [{
@@ -168,7 +189,6 @@ def generate_xray_config(parsed_link, local_port):
         "outbounds": []
     }
 
-    # Outbound settings
     outbound = {
         "protocol": protocol,
         "settings": {
@@ -184,7 +204,6 @@ def generate_xray_config(parsed_link, local_port):
         }
     }
 
-    # Protocol-specific User object
     user = {"id": parsed_link["uuid"]}
     if protocol == "vless":
         user["encryption"] = "none"
@@ -195,17 +214,13 @@ def generate_xray_config(parsed_link, local_port):
         user["security"] = "auto"
     
     outbound["settings"]["vnext"][0]["users"].append(user)
-
-    # Stream Settings (Transport & Security)
     ss = outbound["streamSettings"]
     
-    # 1. Transport Logic
     if parsed_link["type"] == "ws":
         ss["wsSettings"] = {"path": parsed_link["path"]}
     elif parsed_link["type"] == "grpc":
         ss["grpcSettings"] = {"serviceName": parsed_link.get("path", "")}
 
-    # 2. Security Logic (Reality / TLS)
     if parsed_link["security"] == "reality":
         ss["realitySettings"] = {
             "show": False,
@@ -263,24 +278,29 @@ async def audit_single_link(link, local_port):
     with open(config_path, "w") as f: json.dump(config, f)
         
     try:
+        # Start Xray
         xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         await asyncio.sleep(2)
         
+        # Test 1: Gemini
         is_gemini, g_msg = await check_gemini_access(local_port)
+        
+        # Test 2: Speed
         speed, ping = await measure_speed_librespeed(local_port)
         
         verdict = "DEAD"
         if is_gemini and speed >= 1.0: verdict = "ELITE"
         elif is_gemini: verdict = "STABLE"
-        elif speed >= 3.0: verdict = "FAST_NO_GOOGLE"
+        elif speed >= 2.0: verdict = "FAST_NO_GOOGLE"
         
         log_event(f"[{proxy_id}] {verdict} | {speed}Mbps | {g_msg} | {parsed['protocol'].upper()}")
         
         xray_proc.terminate()
-        os.remove(config_path)
+        if os.path.exists(config_path): os.remove(config_path)
         return link, verdict, speed
-    except:
+    except Exception as e:
         if 'xray_proc' in locals(): xray_proc.terminate()
+        if os.path.exists(config_path): os.remove(config_path)
         return link, "DEAD", 0
 
 async def main_orchestrator():
@@ -298,9 +318,10 @@ async def main_orchestrator():
     direct_configs = [l for l in lines if '://' in l and not l.startswith('http')]
     
     fetched_links = await fetch_external_subs(sub_urls)
-    total_candidates = list(set(direct_configs + fetched_links))
     
-    log_event(f"[PARSER] Total candidate nodes after extraction: {len(total_candidates)}")
+    # Remove exact duplicates across all sources
+    raw_candidates = list(set(direct_configs + fetched_links))
+    log_event(f"[PARSER] Raw candidates found: {len(raw_candidates)}")
 
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
@@ -311,21 +332,21 @@ async def main_orchestrator():
         log_event(f"[CACHE] Loaded {len(dead_cache)} dead hashes.")
 
     fresh_links = []
-    for l in total_candidates:
+    for l in raw_candidates:
         link_hash = get_md5(l)
         if link_hash not in dead_cache:
             fresh_links.append(l)
-        else:
-            # Optional debug: log_event(f"  [-] Skipping cached: {link_hash}")
-            pass
 
-    log_event(f"[PARSER] Processing {len(fresh_links)} fresh nodes.")
+    log_event(f"[PARSER] Filtering complete. {len(fresh_links)} unique fresh nodes to test.")
 
+    # Sort to prioritize certain protocols if needed (optional)
     base_port = 10808
     for link in fresh_links:
         res_link, cat, speed = await audit_single_link(link, base_port)
+        
         if cat == "DEAD":
-            with open(DEAD_CACHE_FILE, "a") as f: f.write(get_md5(res_link) + "\n")
+            with open(DEAD_CACHE_FILE, "a") as f: 
+                f.write(get_md5(res_link) + "\n")
         else:
             fname = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
             with open(fname, "a") as f:
