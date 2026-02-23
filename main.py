@@ -72,77 +72,77 @@ def manage_cache_lifecycle():
         with open(CLEANUP_LOG, "w") as f_out: 
             f_out.write(now.isoformat())
 
+def extract_server_identity(node_string):
+    """
+    Industrial logic: Extracts Host:Port to prevent testing duplicates.
+    Example: vless://uuid@1.2.3.4:443 -> 1.2.3.4:443
+    """
+    # Look for the pattern @host:port
+    match = re.search(r'@([^:/]+):(\d+)', node_string)
+    if match:
+        return f"{match.group(1)}:{match.group(2)}"
+    return node_string
+
 def extract_configs_from_text(text):
     """
-    Advanced recursive extraction with "Smart Boundary Detection".
-    Finds links even if they are concatenated or hidden in deep Base64.
+    Industrial recursive extraction logic.
+    Identifies boundaries, decodes deep Base64, and deduplicates by Host:Port.
     """
-    found_links = set()
+    patterns = {
+        'vless': r'vless://[^\s"\'<>|]+',
+        'vmess': r'vmess://[^\s"\'<>|]+',
+        'trojan': r'trojan://[^\s"\'<>|]+',
+        'ss': r'ss://[^\s"\'<>|]+',
+        'hy2': r'hy2://[^\s"\'<>|]+'
+    }
     
-    def find_raw_links(s):
-        # Improved regex with positive lookahead to stop before the next protocol or specific delimiters
-        # This prevents "eating" multiple links into one string
-        pattern = r'(vless|vmess|ss|trojan)://(?:(?!(vless|vmess|ss|trojan)://)[^\s"\'<>|])+?'
-        # After extraction, we trim common trailing characters that shouldn't be there
-        raw_matches = re.finditer(pattern, s, re.IGNORECASE)
-        results = []
-        for match in raw_matches:
-            link = match.group(0)
-            # Clean trailing junk like dots, commas or brackets that might be captured
-            link = link.rstrip('.,;)]}>')
-            results.append(link)
-        return results
-
-    # 1. Pre-cleaning
-    # Remove HTML tags but keep content
+    found_raw = []
+    
+    # 1. Clean invisible characters and HTML
     text = re.sub(r'<[^>]+>', ' ', text)
-    # Remove Zero Width Space and invisible junk
     text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '')
-    
-    # 2. Extract direct links
-    for link in find_raw_links(text):
-        if link.strip():
-            found_links.add(link.strip())
 
-    # 3. Recursive Base64 Extraction
-    # Look for Base64 blocks. URL-safe Base64 uses '-' and '_'
-    potential_blocks = re.findall(r'[a-zA-Z0-9+/=\-_]{32,}', text)
-    
-    for block in potential_blocks:
-        clean_block = block.strip()
-        # Fix padding for standard b64decode
-        clean_block = clean_block.replace('-', '+').replace('_', '/')
-        missing_padding = len(clean_block) % 4
-        if missing_padding:
-            clean_block += '=' * (4 - missing_padding)
-            
+    # 2. Direct extraction with industrial patterns
+    for proto, pattern in patterns.items():
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for m in matches:
+            # Clean trailing junk
+            found_raw.append(m.rstrip('.,;)]}>'))
+
+    # 3. Industrial Base64 block detection (looking for long enough blocks)
+    b64_blocks = re.findall(r'[a-zA-Z0-9+/=\-_]{50,}', text)
+    for block in b64_blocks:
         try:
-            decoded_bytes = base64.b64decode(clean_block)
-            decoded = decoded_bytes.decode('utf-8', errors='ignore')
+            # Normalize for standard b64
+            clean_b64 = block.replace('-', '+').replace('_', '/')
+            clean_b64 += "=" * (-len(clean_b64) % 4)
             
-            # If the decoded content contains protocol markers, process it
-            if any(proto in decoded.lower() for proto in ["vless://", "vmess://", "ss://", "trojan://"]):
-                for link in find_raw_links(decoded):
-                    found_links.add(link.strip())
-                
-                # Recursive depth check to prevent infinite loops (Max 3 levels)
-                # We use a simplified check here
-                if "://" in decoded:
-                    # Search again in the decoded result
-                    inner_links = find_raw_links(decoded)
-                    for i_link in inner_links:
-                        found_links.add(i_link)
+            decoded = base64.b64decode(clean_b64).decode('utf-8', errors='ignore')
+            
+            # If protocol found inside, run extraction on decoded content
+            if any(p in decoded.lower() for p in patterns.keys()):
+                # Call internal logic for the decoded piece
+                inner_configs = extract_configs_from_text(decoded)
+                found_raw.extend(inner_configs)
         except:
             continue
 
-    return list(found_links)
+    # 4. Deduplication based on Identity (Host:Port)
+    unique_nodes = {}
+    for node in found_raw:
+        identity = extract_server_identity(node)
+        # We prefer the first one found or we could add logic for "longest" string
+        if identity not in unique_nodes:
+            unique_nodes[identity] = node
+            
+    return list(unique_nodes.values())
 
 async def fetch_external_subs(urls):
     """
     Downloads subscription content with browser emulation and error handling.
     """
     all_links = []
-    timeout = aiohttp.ClientTimeout(total=45) # Increased for 5000+ nodes
+    timeout = aiohttp.ClientTimeout(total=45)
     
     async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
         for url in urls:
@@ -156,7 +156,7 @@ async def fetch_external_subs(urls):
                     if resp.status == 200:
                         content = await resp.text()
                         found = extract_configs_from_text(content)
-                        log_event(f"  [+] Extracted {len(found)} nodes from this source.")
+                        log_event(f"  [+] Extracted {len(found)} unique nodes from this source.")
                         all_links.extend(found)
                     else:
                         log_event(f"  [!] HTTP Error {resp.status} for source.")
@@ -167,7 +167,6 @@ async def fetch_external_subs(urls):
 def parse_proxy_link(link):
     """
     Advanced parser for VLESS and VMESS protocols.
-    Includes aggressive JSON cleaning for pretty-printed VMESS configs.
     """
     try:
         # Handle VMESS
@@ -176,13 +175,10 @@ def parse_proxy_link(link):
             b64_part = parts[0].strip()
             remark = parts[1] if len(parts) > 1 else "Unnamed"
             
-            # Clean all whitespace from the Base64 string
             b64_part = re.sub(r'\s+', '', b64_part)
-            # Fix padding
             b64_part += "=" * (-len(b64_part) % 4)
             
-            decoded_str = base64.b64decode(b64_part).decode('utf-8', errors='ignore')
-            decoded_str = decoded_str.strip()
+            decoded_str = base64.b64decode(b64_part).decode('utf-8', errors='ignore').strip()
             
             json_match = re.search(r'\{.*\}', decoded_str, re.DOTALL)
             if json_match:
@@ -369,7 +365,7 @@ async def audit_single_link(link, local_port):
             stdout=subprocess.DEVNULL, 
             stderr=subprocess.DEVNULL
         )
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(3.0) # Slightly more wait for stability
         
         is_gemini, g_msg = await check_gemini_access(local_port)
         speed, ping = await measure_speed_librespeed(local_port)
@@ -415,8 +411,15 @@ async def main_orchestrator():
     direct_configs = [l for l in lines if '://' in l and not l.startswith('http')]
     
     fetched_links = await fetch_external_subs(sub_urls)
-    raw_candidates = list(set(direct_configs + fetched_links))
-    log_event(f"[PARSER] Raw candidates found: {len(raw_candidates)}")
+    
+    # Use industrial extractor on any raw text input as well
+    processed_direct = []
+    for raw_text in direct_configs:
+        processed_direct.extend(extract_configs_from_text(raw_text))
+
+    # Combine and final industrial deduplication
+    raw_candidates = extract_configs_from_text("\n".join(fetched_links + processed_direct))
+    log_event(f"[PARSER] Total unique nodes found: {len(raw_candidates)}")
 
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
@@ -439,22 +442,28 @@ async def main_orchestrator():
         if not os.path.exists(rf):
             with open(rf, "w") as f: pass
 
-    for link in fresh_links:
-        res_link, cat, speed = await audit_single_link(link, base_port)
-        
-        if cat == "DEAD":
-            with open(DEAD_CACHE_FILE, "a") as f: 
-                f.write(get_md5(res_link) + "\n")
-        else:
-            fname = {
-                "ELITE": ELITE_GEMINI, 
-                "STABLE": STABLE_CHAT, 
-                "FAST_NO_GOOGLE": FAST_NO_GOOGLE
-            }.get(cat)
+    # Robust Loop with logging
+    for i, link in enumerate(fresh_links):
+        log_event(f"[PROGRESS] Testing node {i+1}/{len(fresh_links)}...")
+        try:
+            res_link, cat, speed = await audit_single_link(link, base_port)
             
-            if fname:
-                with open(fname, "a") as f:
-                    f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
+            if cat == "DEAD":
+                with open(DEAD_CACHE_FILE, "a") as f: 
+                    f.write(get_md5(res_link) + "\n")
+            else:
+                fname = {
+                    "ELITE": ELITE_GEMINI, 
+                    "STABLE": STABLE_CHAT, 
+                    "FAST_NO_GOOGLE": FAST_NO_GOOGLE
+                }.get(cat)
+                
+                if fname:
+                    with open(fname, "a") as f:
+                        f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
+        except Exception as e:
+            log_event(f"[CRITICAL LOOP ERROR] {e}")
+            continue
 
     log_event("--- AUDIT COMPLETE ---")
 
