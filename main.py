@@ -39,94 +39,147 @@ HEADERS = {
 }
 
 def log_event(msg):
-    """Real-time logging for GitHub Actions."""
+    """
+    Real-time logging for GitHub Actions with timestamps.
+    """
     timestamp = datetime.now().strftime('%H:%M:%S')
     print(f"[{timestamp}] {msg}", flush=True)
 
 def get_md5(text):
+    """
+    Generates MD5 hash for a string to identify unique nodes.
+    """
     return hashlib.md5(text.strip().encode()).hexdigest()
 
 def manage_cache_lifecycle():
+    """
+    Manages the 72-hour cleanup cycle for the dead nodes cache.
+    """
     now = datetime.now()
     if os.path.exists(CLEANUP_LOG):
         with open(CLEANUP_LOG, "r") as f:
             try:
                 last_run = datetime.fromisoformat(f.read().strip())
                 if now - last_run > timedelta(hours=72):
-                    log_event("[CLEANUP] 72h cycle! Wiping dead_cache...")
-                    if os.path.exists(DEAD_CACHE_FILE): os.remove(DEAD_CACHE_FILE)
-                    with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
-            except: pass
+                    log_event("[CLEANUP] 72h cycle reached! Wiping dead_cache...")
+                    if os.path.exists(DEAD_CACHE_FILE): 
+                        os.remove(DEAD_CACHE_FILE)
+                    with open(CLEANUP_LOG, "w") as f_out: 
+                        f_out.write(now.isoformat())
+            except Exception as e:
+                log_event(f"[CLEANUP ERROR] {e}")
     else:
-        with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
+        with open(CLEANUP_LOG, "w") as f_out: 
+            f_out.write(now.isoformat())
 
 def extract_configs_from_text(text):
-    """Deep extraction of proxy links from raw or Base64 encoded text."""
-    results = []
+    """
+    Advanced recursive extraction. 
+    Handles: Mixed plain text, pure Base64, and Base64 wrapped in garbage/HTML.
+    Cleans invisible characters and standardizes output.
+    """
+    found_links = set()
     
-    # Clean the input text from common garbage
-    text = text.strip()
-    
-    # Helper to find protocol links in any string
-    def find_links(s):
+    def find_raw_links(s):
+        # Match standard proxy protocols: vless, vmess, ss, trojan
         pat = r'(vless|vmess|ss|trojan)://[^\s|#\^]+(?:#[^\s]*)?'
         return re.findall(pat, s, re.IGNORECASE)
 
-    # 1. Try to find links directly (unencoded content)
-    results.extend(find_links(text))
-
-    # 2. Try to decode as a whole block (Aggressive Base64 cleaning)
-    # Remove newlines, spaces, and potential URL-safe characters before decoding
-    cleaned_b64 = re.sub(r'[^a-zA-Z0-9+/=]', '', text)
-    try:
-        decoded = base64.b64decode(cleaned_b64 + "===").decode('utf-8', errors='ignore')
-        if "://" in decoded:
-            results.extend(find_links(decoded))
-    except:
-        pass
+    # 1. Clean HTML tags and invisible Unicode characters
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Remove Zero Width Space and other invisible junk
+    text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '')
     
-    # 3. If direct links are few, try finding Base64-like substrings (for mixed content)
-    if len(results) < 5:
-        # Search for long alphanumeric strings that could be Base64
-        potential_b64_blocks = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
-        for block in potential_b64_blocks:
-            try:
-                dec = base64.b64decode(block + "===").decode('utf-8', errors='ignore')
-                results.extend(find_links(dec))
-            except:
-                continue
+    # 2. Extract any direct links from the text
+    for link in find_raw_links(text):
+        found_links.add(link.strip())
 
-    return list(set(results))
+    # 3. Aggressive Base64 extraction
+    # Look for strings that look like Base64 (alphanumeric + some symbols)
+    # and are long enough to be a config list (at least 32 chars).
+    potential_blocks = re.findall(r'[a-zA-Z0-9+/=\s\n\r]{32,}', text)
+    
+    for block in potential_blocks:
+        # Crucial: Remove ALL whitespace that breaks b64decode
+        clean_block = re.sub(r'\s+', '', block)
+        
+        # Base64 strings must have a length multiple of 4
+        missing_padding = len(clean_block) % 4
+        if missing_padding:
+            clean_block += '=' * (4 - missing_padding)
+            
+        try:
+            decoded_bytes = base64.b64decode(clean_block)
+            decoded = decoded_bytes.decode('utf-8', errors='ignore')
+            
+            # If the decoded content has protocol markers, we process it
+            if any(proto in decoded.lower() for proto in ["vless://", "vmess://", "ss://", "trojan://"]):
+                # Recursive call to find links inside the decoded content
+                for link in find_raw_links(decoded):
+                    found_links.add(link.strip())
+                
+                # Check for nested Base64 (common in some subscription aggregators)
+                # Only go deeper if we haven't found a massive amount of links yet
+                if len(found_links) < 100:
+                    nested = extract_configs_from_text(decoded)
+                    for n_link in nested:
+                        found_links.add(n_link)
+        except:
+            continue
+
+    return list(found_links)
 
 async def fetch_external_subs(urls):
-    """Downloads content from external subscription URLs with browser emulation."""
+    """
+    Downloads subscription content with browser emulation and error handling.
+    """
     all_links = []
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
+    timeout = aiohttp.ClientTimeout(total=30) # Increased timeout for large 5000+ lists
+    
+    async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
         for url in urls:
             url = url.strip()
-            if not url.startswith('http'): continue
+            if not url.startswith('http'): 
+                continue
+            
             log_event(f"[FETCH] Downloading: {url}")
             try:
-                # Use allow_redirects=True to handle URL shorteners/gateways
-                async with session.get(url, timeout=20, allow_redirects=True) as resp:
+                async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.text()
                         found = extract_configs_from_text(content)
                         log_event(f"  [+] Extracted {len(found)} nodes.")
                         all_links.extend(found)
                     else:
-                        log_event(f"  [!] HTTP Error {resp.status} for {url[:30]}...")
+                        log_event(f"  [!] HTTP Error {resp.status} for {url[:40]}...")
             except Exception as e:
-                log_event(f"  [!] Fetch failed: {str(e)[:50]}")
+                log_event(f"  [!] Fetch failed for {url[:40]}... -> {str(e)[:50]}")
     return all_links
 
 def parse_proxy_link(link):
-    """Advanced parser for VLESS and VMESS protocols."""
+    """
+    Advanced parser for VLESS and VMESS protocols.
+    Includes aggressive JSON cleaning for pretty-printed VMESS configs.
+    """
     try:
-        if link.startswith("vmess://"):
-            b64_data = link.replace("vmess://", "").split("#")[0]
-            b64_data += "=" * (-len(b64_data) % 4)
-            data = json.loads(base64.b64decode(b64_data).decode('utf-8'))
+        # Handle VMESS
+        if link.lower().startswith("vmess://"):
+            b64_part = link[8:].split("#")[0].strip()
+            # Clean all whitespace from the Base64 string
+            b64_part = re.sub(r'\s+', '', b64_part)
+            # Fix padding
+            b64_part += "=" * (-len(b64_part) % 4)
+            
+            decoded_str = base64.b64decode(b64_part).decode('utf-8', errors='ignore')
+            # Clean JSON string from potential junk before parsing
+            decoded_str = decoded_str.strip()
+            # Handle cases where JSON might be wrapped in more junk
+            json_match = re.search(r'\{.*\}', decoded_str, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+            else:
+                return None
+
             return {
                 "protocol": "vmess",
                 "host": data.get("add"),
@@ -134,16 +187,18 @@ def parse_proxy_link(link):
                 "uuid": data.get("id"),
                 "sni": data.get("sni") or data.get("host", ""),
                 "path": data.get("path", "/"),
-                "security": data.get("tls", "none"),
+                "security": data.get("tls", "none") if data.get("tls") != "" else "none",
                 "type": data.get("net", "tcp"),
                 "aid": data.get("aid", 0),
                 "remark": data.get("ps", "Unnamed")
             }
             
-        elif link.startswith("vless://"):
+        # Handle VLESS
+        elif link.lower().startswith("vless://"):
             parsed = urlparse(link)
             netloc = parsed.netloc
-            if "@" not in netloc: return None
+            if "@" not in netloc: 
+                return None
             
             user_info, host_port = netloc.split("@")
             uuid = user_info
@@ -163,7 +218,7 @@ def parse_proxy_link(link):
                 "host": host,
                 "port": port,
                 "sni": params.get("sni", ""),
-                "path": params.get("path", "/"),
+                "path": unquote(params.get("path", "/")),
                 "security": params.get("security", "none"),
                 "type": params.get("type", "tcp"),
                 "flow": params.get("flow", ""),
@@ -171,12 +226,16 @@ def parse_proxy_link(link):
                 "sid": params.get("sid", ""),
                 "fp": params.get("fp", "chrome")
             }
-    except Exception:
+    except Exception as e:
+        # Silent fail for individual link parsing
         return None
     return None
 
 def generate_xray_config(parsed_link, local_port):
-    """Generates a specialized JSON config for Xray based on protocol and security."""
+    """
+    Generates a production-ready JSON config for Xray core.
+    Supports Reality, TLS, WebSocket, and gRPC.
+    """
     protocol = parsed_link["protocol"]
     config = {
         "log": {"loglevel": "none"},
@@ -216,11 +275,13 @@ def generate_xray_config(parsed_link, local_port):
     outbound["settings"]["vnext"][0]["users"].append(user)
     ss = outbound["streamSettings"]
     
+    # Network specific settings
     if parsed_link["type"] == "ws":
         ss["wsSettings"] = {"path": parsed_link["path"]}
     elif parsed_link["type"] == "grpc":
         ss["grpcSettings"] = {"serviceName": parsed_link.get("path", "")}
 
+    # Security specific settings
     if parsed_link["security"] == "reality":
         ss["realitySettings"] = {
             "show": False,
@@ -241,8 +302,12 @@ def generate_xray_config(parsed_link, local_port):
     return config
 
 async def check_gemini_access(socks_port):
+    """
+    Verifies if Google AI Studio (Gemini) is accessible via the proxy.
+    """
     try:
         proxy_url = f"socks5h://127.0.0.1:{socks_port}"
+        # Using curl for a reliable SOCKS5h check
         cmd = [
             "curl", "-s", "-L", "-k", "--proxy", proxy_url,
             GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15",
@@ -251,64 +316,100 @@ async def check_gemini_access(socks_port):
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
-        return (True, "OK") if "200" in res else (False, f"HTTP_{res}")
-    except:
-        return False, "Error"
+        # Look for 200 OK or 302 Redirect (often happens with auth gates)
+        return (True, "OK") if "200" in res or "302" in res else (False, f"HTTP_{res}")
+    except Exception as e:
+        return False, f"Error: {str(e)[:20]}"
 
 async def measure_speed_librespeed(socks_port):
+    """
+    Measures download speed and ping using the librespeed-cli.
+    """
     try:
+        if not os.path.exists(LIBRESPEED_PATH):
+            return 0.0, 0.0
+            
         cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "5"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
+        
         if proc.returncode == 0:
             data = json.loads(stdout.decode())
-            return round(data.get("download", 0) / 1024 / 1024, 2), round(data.get("ping", 0), 1)
-        return 0, 0
+            down_mbps = round(data.get("download", 0) / 1024 / 1024, 2)
+            ping_ms = round(data.get("ping", 0), 1)
+            return down_mbps, ping_ms
+        return 0.0, 0.0
     except:
-        return 0, 0
+        return 0.0, 0.0
 
 async def audit_single_link(link, local_port):
+    """
+    Complete audit cycle for a single node.
+    """
     proxy_id = get_md5(link)[:8]
     parsed = parse_proxy_link(link)
+    
     if not parsed: 
         return link, "DEAD", 0
     
     config = generate_xray_config(parsed, local_port)
     config_path = f"config_{proxy_id}.json"
-    with open(config_path, "w") as f: json.dump(config, f)
+    
+    with open(config_path, "w") as f: 
+        json.dump(config, f)
         
+    xray_proc = None
     try:
-        # Start Xray
-        xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        await asyncio.sleep(2)
+        # Start Xray Core
+        xray_proc = subprocess.Popen(
+            [XRAY_PATH, "-c", config_path], 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL
+        )
+        # Give Xray time to establish connection
+        await asyncio.sleep(2.5)
         
-        # Test 1: Gemini
+        # Test Gemini Access
         is_gemini, g_msg = await check_gemini_access(local_port)
         
-        # Test 2: Speed
+        # Test Speed (only if Gemini works or for Fast category)
         speed, ping = await measure_speed_librespeed(local_port)
         
+        # Logic for classification
         verdict = "DEAD"
-        if is_gemini and speed >= 1.0: verdict = "ELITE"
-        elif is_gemini: verdict = "STABLE"
-        elif speed >= 2.0: verdict = "FAST_NO_GOOGLE"
+        if is_gemini and speed >= 1.0: 
+            verdict = "ELITE"
+        elif is_gemini: 
+            verdict = "STABLE"
+        elif speed >= 2.5: 
+            verdict = "FAST_NO_GOOGLE"
         
         log_event(f"[{proxy_id}] {verdict} | {speed}Mbps | {g_msg} | {parsed['protocol'].upper()}")
         
+        # Cleanup
         xray_proc.terminate()
+        xray_proc.wait()
         if os.path.exists(config_path): os.remove(config_path)
+        
         return link, verdict, speed
+        
     except Exception as e:
-        if 'xray_proc' in locals(): xray_proc.terminate()
+        if xray_proc: 
+            xray_proc.terminate()
+            xray_proc.wait()
         if os.path.exists(config_path): os.remove(config_path)
         return link, "DEAD", 0
 
 async def main_orchestrator():
+    """
+    The main engine: loads sources, downloads content, filters cache, and audits nodes.
+    """
     log_event("--- SIERRA X-RAY ORCHESTRATOR ONLINE ---")
     manage_cache_lifecycle()
     
+    # 1. Read sources from raw_links.txt
     if not os.path.exists(RAW_LINKS_FILE):
-        log_event("[ERROR] raw_links.txt missing.")
+        log_event(f"[ERROR] {RAW_LINKS_FILE} missing.")
         return
 
     with open(RAW_LINKS_FILE, "r") as f:
@@ -317,18 +418,20 @@ async def main_orchestrator():
     sub_urls = [l for l in lines if l.startswith('http')]
     direct_configs = [l for l in lines if '://' in l and not l.startswith('http')]
     
+    # 2. Fetch external subscriptions
     fetched_links = await fetch_external_subs(sub_urls)
     
-    # Remove exact duplicates across all sources
+    # 3. Deduplication and Initial Cleanup
     raw_candidates = list(set(direct_configs + fetched_links))
     log_event(f"[PARSER] Raw candidates found: {len(raw_candidates)}")
 
+    # 4. Filter against Dead Cache
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             for line in f:
-                line = line.strip()
-                if line: dead_cache.add(line)
+                h = line.strip()
+                if h: dead_cache.add(h)
         log_event(f"[CACHE] Loaded {len(dead_cache)} dead hashes.")
 
     fresh_links = []
@@ -339,8 +442,16 @@ async def main_orchestrator():
 
     log_event(f"[PARSER] Filtering complete. {len(fresh_links)} unique fresh nodes to test.")
 
-    # Sort to prioritize certain protocols if needed (optional)
+    # 5. Execute Audit
+    # We use a fixed port for simplicity, but could be dynamic for parallel testing
     base_port = 10808
+    
+    # Clear result files from previous run if needed or just append
+    # Here we append to maintain history if requested, but usually, we start fresh
+    for rf in RESULT_FILES:
+        if not os.path.exists(rf):
+            with open(rf, "w") as f: pass
+
     for link in fresh_links:
         res_link, cat, speed = await audit_single_link(link, base_port)
         
@@ -348,11 +459,26 @@ async def main_orchestrator():
             with open(DEAD_CACHE_FILE, "a") as f: 
                 f.write(get_md5(res_link) + "\n")
         else:
-            fname = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
-            with open(fname, "a") as f:
-                f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
+            fname = {
+                "ELITE": ELITE_GEMINI, 
+                "STABLE": STABLE_CHAT, 
+                "FAST_NO_GOOGLE": FAST_NO_GOOGLE
+            }.get(cat)
+            
+            if fname:
+                with open(fname, "a") as f:
+                    f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
 
     log_event("--- AUDIT COMPLETE ---")
 
 if __name__ == "__main__":
+    # Ensure binary execution permissions (specific to Linux environments like GitHub Actions)
+    try:
+        if os.path.exists(LIBRESPEED_PATH):
+            os.chmod(LIBRESPEED_PATH, 0o755)
+        if os.path.exists(XRAY_PATH):
+            os.chmod(XRAY_PATH, 0o755)
+    except:
+        pass
+        
     asyncio.run(main_orchestrator())
