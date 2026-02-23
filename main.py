@@ -28,10 +28,8 @@ FAST_NO_GOOGLE = "Fast_NoGoogle.txt"
 
 RESULT_FILES = [ELITE_GEMINI, STABLE_CHAT, FAST_NO_GOOGLE]
 
-# Paths for Binaries - ALIGNED WITH GITHUB WORKFLOW
-# Xray installed via script goes to /usr/local/bin, so we use global command
+# Paths for Binaries
 XRAY_PATH = "xray" 
-# Librespeed downloaded locally in workflow
 LIBRESPEED_PATH = "./librespeed-cli" 
 
 # Critical Links
@@ -46,6 +44,9 @@ BASE_PORT = 10800
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 }
+
+# Global lock for file operations
+file_lock = asyncio.Lock()
 
 def log_event(msg):
     """
@@ -72,6 +73,7 @@ def get_md5(text):
     Normalization: cuts off tails (# and ?) to ensure same node = same MD5.
     """
     try:
+        # Normalize: remove remarks and query params for uniqueness
         if "vmess://" in text:
             normalized = text.strip().split('#')[0]
         else:
@@ -165,9 +167,11 @@ def extract_configs_from_text(text, depth=0):
             potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
             for chunk in potential_b64:
                 padded = chunk + "=" * (-len(chunk) % 4)
-                decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-                if any(p in decoded.lower() for p in ['vless://', 'vmess://', 'trojan://']):
-                    found_raw.extend(extract_configs_from_text(decoded, depth + 1))
+                try:
+                    decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+                    if any(p in decoded.lower() for p in ['vless://', 'vmess://', 'trojan://']):
+                        found_raw.extend(extract_configs_from_text(decoded, depth + 1))
+                except: continue
         except:
             pass
 
@@ -175,7 +179,7 @@ def extract_configs_from_text(text, depth=0):
 
 async def fetch_external_subs(urls):
     """
-    Downloads subscription content and extracts clean links with strict timeouts.
+    Downloads subscription content and extracts clean links.
     """
     all_links = []
     timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=10)
@@ -229,7 +233,8 @@ def parse_proxy_link(link):
             main = parts[0]
             if "@" in main:
                 auth, hp = main.split("@")
-                method, password = (base64.b64decode(auth + "="*(-len(auth)%4)).decode()).split(":") if ":" not in auth else auth.split(":")
+                method_pass = base64.b64decode(auth + "="*(-len(auth)%4)).decode()
+                method, password = method_pass.split(":") if ":" in method_pass else (method_pass, "")
                 h, p = hp.split(":")
             else:
                 decoded = base64.b64decode(main + "="*(-len(main)%4)).decode()
@@ -286,48 +291,56 @@ def generate_xray_config(parsed_link, local_port):
 
 async def check_gemini_access(socks_port):
     """
-    Check Gemini access via SOCKS5h.
+    Check Gemini access via SOCKS5h with timeout protection.
     """
     try:
         cmd = ["curl", "-s", "-L", "-k", "--proxy", f"socks5h://127.0.0.1:{socks_port}", GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15", "-w", "%{http_code}"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = await proc.communicate()
-        res = stdout.decode().strip()
-        return ("200" in res or "302" in res), res
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+            res = stdout.decode().strip()
+            return ("200" in res or "302" in res), res
+        except asyncio.TimeoutError:
+            if proc: proc.kill()
+            return False, "TIMEOUT"
     except: return False, "ERR"
 
 async def measure_speed_librespeed(socks_port):
     """
-    Speed test via Librespeed CLI.
+    Speed test via Librespeed CLI with memory optimization (shorter duration).
     """
     try:
         if not os.path.exists(LIBRESPEED_PATH):
             return 0.0, 0.0
             
-        cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "15"]
+        # Reduced duration to 7s to save memory and time
+        cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "7"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
             if proc.returncode == 0:
                 data = json.loads(stdout.decode())
                 return round(data.get("download", 0) / 1024 / 1024, 2), round(data.get("ping", 0), 1)
         except:
-            if proc: proc.kill()
+            if proc: 
+                try: proc.kill()
+                except: pass
         return 0.0, 0.0
     except: return 0.0, 0.0
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Audit process for a single proxy node.
+    Audit process for a single proxy node with strict process management.
     """
     async with semaphore:
         link_md5 = get_md5(link)
         
-        # Atomic Double Check
-        for rf in RESULT_FILES:
-            if os.path.exists(rf):
-                with open(rf, "r") as f:
-                    if any(link_md5 in line for line in f): return link, "ALREADY_DONE", 0
+        # Pre-check results to avoid work
+        async with file_lock:
+            for rf in RESULT_FILES:
+                if os.path.exists(rf):
+                    with open(rf, "r") as f:
+                        if link_md5 in f.read(): return link, "ALREADY_DONE", 0
         
         parsed = parse_proxy_link(link)
         if not parsed: return link, "DEAD", 0
@@ -337,16 +350,15 @@ async def audit_single_link(link, local_port, semaphore):
             
         xray_proc = None
         try:
-            # We assume 'xray' is in system PATH (installed via official script)
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(6.5) 
+            await asyncio.sleep(5) # Standard wait for startup
             
-            is_gemini, g_msg = await check_gemini_access(local_port)
+            is_gemini, _ = await check_gemini_access(local_port)
             speed, ping = await measure_speed_librespeed(local_port)
             
             cat = "DEAD"
             if is_gemini and speed >= 0.8: cat = "ELITE"
-            elif is_gemini or speed > 0.02: cat = "STABLE"
+            elif is_gemini or (speed > 0.05 and speed < 1.0): cat = "STABLE"
             elif speed >= 1.0: cat = "FAST_NO_GOOGLE"
             
             log_event(f"Node {link_md5[:6]} -> {cat} ({speed} Mbps)")
@@ -355,18 +367,26 @@ async def audit_single_link(link, local_port, semaphore):
             return link, f"ERROR: {str(e)[:20]}", 0
         finally:
             if xray_proc:
-                xray_proc.kill()
-                xray_proc.wait()
-            if os.path.exists(config_path): os.remove(config_path)
+                try:
+                    xray_proc.terminate()
+                    # Hard kill if not dead in 2s
+                    for _ in range(20):
+                        if xray_proc.poll() is not None: break
+                        await asyncio.sleep(0.1)
+                    if xray_proc.poll() is None: xray_proc.kill()
+                except: pass
+            if os.path.exists(config_path): 
+                try: os.remove(config_path)
+                except: pass
 
 async def main_orchestrator():
     """
-    Main loop with recursion and loop prevention.
+    Main loop with optimized batching and snapshot management.
     """
     if os.path.exists(LOCK_FILE):
         mtime = os.path.getmtime(LOCK_FILE)
-        if time.time() - mtime < 600: 
-            print("🚫 СИСТЕМА ЗАБЛОКИРОВАНА: Процесс уже идет.")
+        if time.time() - mtime < 900: 
+            print("🚫 СИСТЕМА ЗАБЛОКИРОВАНА: Процесс активен.")
             sys.exit(0)
     
     with open(LOCK_FILE, "w") as f: f.write(str(os.getpid()))
@@ -376,7 +396,6 @@ async def main_orchestrator():
         kill_process_by_name("xray")
         manage_cache_lifecycle()
 
-        # 2. LOAD SNAPSHOT OR FETCH
         total_candidates = []
         if os.path.exists(TEMP_POOL_FILE):
             log_event("♻️ Загрузка из Снапшота...")
@@ -386,12 +405,15 @@ async def main_orchestrator():
             if not os.path.exists(RAW_LINKS_FILE): 
                 log_event("❌ RAW_LINKS_FILE не найден.")
                 return
-            with open(RAW_LINKS_FILE, "r") as f: content = f.read()
             
+            with open(RAW_LINKS_FILE, "r") as f: content = f.read()
             sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
+            
+            log_event(f"🌐 Сбор подписок: {len(sub_urls)} URL...")
             fetched = await fetch_external_subs(sub_urls)
             
             pool = list(set(extract_configs_from_text(content) + fetched))
+            
             existing_hashes = set()
             for rf in RESULT_FILES:
                 if os.path.exists(rf):
@@ -406,9 +428,9 @@ async def main_orchestrator():
                     total_candidates.append(link)
                     seen_ips.add(l_ip)
             
+            random.shuffle(total_candidates)
             with open(TEMP_POOL_FILE, "w") as f: json.dump(total_candidates, f)
 
-        # 3. DEAD CACHE FILTER
         dead_cache = set()
         if os.path.exists(DEAD_CACHE_FILE):
             with open(DEAD_CACHE_FILE, "r") as f: dead_cache = {l.strip() for l in f}
@@ -421,27 +443,30 @@ async def main_orchestrator():
             log_event("✅ Новых нод нет.")
             return
 
-        # 4. TESTING BATCHES
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
+        
+        # Testing in smaller batches for responsiveness
         for i in range(0, len(fresh), BATCH_SIZE):
             batch = fresh[i : i + BATCH_SIZE]
             tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
             
-            for link, cat, speed in results:
-                if cat == "ALREADY_DONE": continue
-                l_md5 = get_md5(link)
-                if "ERROR" in cat or cat == "DEAD":
-                    with open(DEAD_CACHE_FILE, "a") as f: f.write(l_md5 + "\n")
-                else:
-                    target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
-                    if target:
-                        with open(target, "a") as f: f.write(f"{link}\n")
+            async with file_lock:
+                for link, cat, speed in results:
+                    if cat == "ALREADY_DONE": continue
+                    l_md5 = get_md5(link)
+                    if "ERROR" in cat or cat == "DEAD":
+                        with open(DEAD_CACHE_FILE, "a") as f: f.write(l_md5 + "\n")
+                    else:
+                        target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
+                        if target:
+                            with open(target, "a") as f: f.write(f"{link}\n")
             
-            # Save progress after batch
-            with open(TEMP_POOL_FILE, "w") as f: json.dump(fresh[i+BATCH_SIZE:], f)
+            # Atomic progress save
+            remaining = fresh[i+BATCH_SIZE:]
+            with open(TEMP_POOL_FILE, "w") as f: json.dump(remaining, f)
 
-        log_event("🏁 ФИНИШ.")
+        log_event("🏁 ФИНИШ. Все ноды обработаны.")
         if os.path.exists(TEMP_POOL_FILE): os.remove(TEMP_POOL_FILE)
 
     finally:
@@ -450,9 +475,10 @@ async def main_orchestrator():
 if __name__ == "__main__":
     try:
         asyncio.run(main_orchestrator())
-    except SystemExit: pass
-    except KeyboardInterrupt: pass
+    except (SystemExit, KeyboardInterrupt): pass
     except Exception as e:
         log_event(f"🔴 CRASH: {e}")
-        if os.path.exists(LOCK_FILE): os.remove(LOCK_FILE)
+        if os.path.exists(LOCK_FILE): 
+            try: os.remove(LOCK_FILE)
+            except: pass
         sys.exit(1)
