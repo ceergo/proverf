@@ -1,33 +1,52 @@
-- name: Setup Python
-    uses: actions/setup-python@v4
-    with:
-      python-version: '3.10'
+name: Sieve Master Deep Audit
 
-  - name: Install Xray-core
-    run: |
-      bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-      xray -version
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */4 * * *'
 
-  - name: Install Librespeed CLI
-    run: |
-      # Fetch latest release from Librespeed
-      curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
-      | grep "browser_download_url.*linux_amd64.tar.gz" \
-      | cut -d : -f 2,3 \
-      | tr -d \" \
-      | wget -qi -
-      tar -xzf *.tar.gz
-      mv librespeed-cli-linux-amd64 librespeed-cli
-      chmod +x librespeed-cli
-      ./librespeed-cli --version
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-  - name: Run Sieve Orchestrator
-    run: python main.py
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-  - name: Commit & Push Results
-    run: |
-      git config --local user.email "action@github.com"
-      git config --local user.name "GitHub Action"
-      git add .
-      git commit -m "Deep Audit Complete (Xray Sieve Mode): $(date -u)" || exit 0
-      git push
+      - name: Install Xray-core
+        run: |
+          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+          xray -version
+
+      - name: Install Librespeed CLI
+        run: |
+          # Download latest release from Librespeed
+          curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
+          | grep "browser_download_url.*linux_amd64.tar.gz" \
+          | cut -d : -f 2,3 \
+          | tr -d \" \
+          | wget -qi -
+          tar -xzf *.tar.gz
+          # Locate the binary (name might vary slightly)
+          find . -name "librespeed-cli*" -exec mv {} librespeed-cli \;
+          chmod +x librespeed-cli
+          ./librespeed-cli --version
+
+      - name: Run Sieve Orchestrator
+        run: python main.py
+
+      - name: Commit and Push Results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # Ensure result files exist to avoid git add errors
+          touch Elite_Gemini.txt Stable_Chat.txt Fast_NoGoogle.txt
+          
+          git add .
+          # Commit only if there are changes
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Deep Audit Complete (Xray Mode): $(date -u)" && git push)
