@@ -24,14 +24,9 @@ jobs:
 
       - name: Install Xray-core (Direct Binary)
         run: |
-          # Get latest tag
-          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-          if [ "$XRAY_VERSION" == "null" ] || [ -z "$XRAY_VERSION" ]; then
-            XRAY_VERSION="v24.12.31"
-          fi
-          
-          echo "Installing Xray $XRAY_VERSION"
-          wget -O xray.zip https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-linux-64.zip
+          echo "Installing latest Xray-core via direct redirect URL..."
+          # Using the stable redirect link provided by GitHub releases
+          wget -O xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           
           # Use a temporary directory to avoid file conflicts (README, etc.)
           mkdir -p ./xray_temp
@@ -47,12 +42,18 @@ jobs:
 
       - name: Install Librespeed CLI
         run: |
-          # Download latest release from Librespeed
+          # Download latest release from Librespeed using redirect strategy
+          echo "Installing latest Librespeed CLI..."
           LATEST_URL=$(curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
           | grep "browser_download_url.*linux_amd64.tar.gz" \
           | cut -d : -f 2,3 \
           | tr -d \" | xargs)
           
+          if [ -z "$LATEST_URL" ]; then
+            echo "Fallback to manual URL for Librespeed"
+            LATEST_URL="https://github.com/librespeed/speedtest-cli/releases/download/v1.1.5/librespeed-cli-linux-amd64.tar.gz"
+          fi
+
           wget -O librespeed.tar.gz $LATEST_URL
           tar -xzf librespeed.tar.gz
           find . -name "librespeed-cli*" -exec mv {} librespeed-cli \;
