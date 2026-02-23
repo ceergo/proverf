@@ -34,6 +34,7 @@ GEMINI_CHECK_URL = "https://aistudio.google.com/app"
 
 # Concurrency & Networking
 MAX_CONCURRENT_TESTS = 5  # Number of parallel Xray instances
+BATCH_SIZE = 10           # Process nodes in batches to avoid task accumulation
 BASE_PORT = 10800         # Starting port for local SOCKS5 proxies
 
 # Browser Emulation Headers
@@ -240,19 +241,16 @@ def parse_proxy_link(link):
             remark = unquote(parts[1]) if len(parts) > 1 else "SS-Node"
             
             if "@" in main_part:
-                # Format: ss://method:password@host:port
                 user_info, host_port = main_part.split("@")
                 if ":" in user_info:
                     method, password = user_info.split(":")
                 else:
-                    # Case where user_info is base64 encoded
                     user_info += "=" * (-len(user_info) % 4)
                     decoded_auth = base64.b64decode(user_info).decode('utf-8')
                     method, password = decoded_auth.split(":")
                 
                 host, port = host_port.split(":")
             else:
-                # Format: ss://base64(method:password@host:port)
                 main_part += "=" * (-len(main_part) % 4)
                 decoded = base64.b64decode(main_part).decode('utf-8')
                 user_info, host_port = decoded.split("@")
@@ -290,7 +288,6 @@ def generate_xray_config(parsed_link, local_port):
         "outbounds": []
     }
 
-    # Special logic for Hysteria2
     if protocol == "hy2":
         config["outbounds"].append({
             "protocol": "hysteria2",
@@ -319,7 +316,6 @@ def generate_xray_config(parsed_link, local_port):
         }
     }
 
-    # Protocol specific settings
     if protocol in ["vless", "vmess"]:
         user = {"id": parsed_link["uuid"]}
         if protocol == "vless":
@@ -351,7 +347,6 @@ def generate_xray_config(parsed_link, local_port):
             "password": parsed_link["password"]
         }]
 
-    # Stream settings (WS, gRPC, Reality, TLS)
     ss = outbound["streamSettings"]
     if ss["network"] == "ws":
         ss["wsSettings"] = {"path": parsed_link["path"]}
@@ -391,7 +386,6 @@ async def check_gemini_access(socks_port):
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
-        # 200 is direct access, 302 often indicates a redirect to login which is also good sign of reachability
         return (True, "OK") if "200" in res or "302" in res else (False, f"HTTP_{res}")
     except Exception as e:
         return False, f"Error: {str(e)[:20]}"
@@ -419,11 +413,10 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Complete audit cycle for a single node with concurrency control.
+    Complete audit cycle for a single node with concurrency control and robust cleanup.
     """
     async with semaphore:
-        # Random randomization to prevent burst requests to target servers
-        await asyncio.sleep(random.uniform(1.0, 3.0))
+        await asyncio.sleep(random.uniform(0.5, 2.0))
         
         proxy_id = get_md5(link)[:8]
         parsed = parse_proxy_link(link)
@@ -439,13 +432,15 @@ async def audit_single_link(link, local_port, semaphore):
             
         xray_proc = None
         try:
-            # Launch Xray core
+            # Launch Xray core as a subprocess
             xray_proc = subprocess.Popen(
                 [XRAY_PATH, "-c", config_path], 
                 stdout=subprocess.DEVNULL, 
                 stderr=subprocess.DEVNULL
             )
-            await asyncio.sleep(5.0) # Buffer for Xray core and handshake initialization
+            
+            # Allow time for initialization
+            await asyncio.sleep(4.0)
             
             # Step 1: Gemini Check
             is_gemini, g_msg = await check_gemini_access(local_port)
@@ -453,7 +448,7 @@ async def audit_single_link(link, local_port, semaphore):
             # Step 2: Speed Check
             speed, ping = await measure_speed_librespeed(local_port)
             
-            # Step 3: Categorization logic
+            # Step 3: Categorization
             verdict = "DEAD"
             if is_gemini and speed >= 1.0: 
                 verdict = "ELITE"
@@ -463,27 +458,30 @@ async def audit_single_link(link, local_port, semaphore):
                 verdict = "FAST_NO_GOOGLE"
             
             log_event(f"[{proxy_id}|Port:{local_port}] {verdict} | {speed}Mbps | {g_msg} | {parsed['protocol'].upper()}")
-            
-            # Cleanup
-            xray_proc.terminate()
-            xray_proc.wait()
-            if os.path.exists(config_path): os.remove(config_path)
-            
             return link, verdict, speed
             
         except Exception as e:
-            log_event(f"[{proxy_id}] Critical failure: {e}")
-            if xray_proc: 
-                xray_proc.terminate()
-                xray_proc.wait()
-            if os.path.exists(config_path): os.remove(config_path)
+            log_event(f"[{proxy_id}] Task error: {e}")
             return link, "DEAD", 0
+        finally:
+            # GURANTEED CLEANUP: Kill Xray and remove config file
+            if xray_proc:
+                try:
+                    xray_proc.kill()
+                    xray_proc.wait(timeout=2)
+                except:
+                    pass
+            if os.path.exists(config_path):
+                try:
+                    os.remove(config_path)
+                except:
+                    pass
 
 async def main_orchestrator():
     """
-    The main engine: loads sources, downloads content, filters cache, and audits nodes in parallel.
+    The main engine with BATCH PROCESSING to prevent GitHub Actions timeout/cancellation.
     """
-    log_event("--- SIERRA X-RAY PARALLEL ORCHESTRATOR ONLINE ---")
+    log_event("--- SIERRA X-RAY BATCH ORCHESTRATOR ONLINE ---")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE):
@@ -496,19 +494,15 @@ async def main_orchestrator():
     sub_urls = [l for l in lines if l.startswith('http')]
     direct_configs = [l for l in lines if '://' in l and not l.startswith('http')]
     
-    # 1. Fetch from subscriptions
     fetched_links = await fetch_external_subs(sub_urls)
     
-    # 2. Extract from direct lines
     processed_direct = []
     for raw_text in direct_configs:
         processed_direct.extend(extract_configs_from_text(raw_text))
 
-    # 3. Combine and final industrial deduplication
     raw_candidates = extract_configs_from_text("\n".join(fetched_links + processed_direct))
     log_event(f"[PARSER] Total unique nodes found: {len(raw_candidates)}")
 
-    # 4. Load dead cache
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
@@ -517,54 +511,53 @@ async def main_orchestrator():
                 if h: dead_cache.add(h)
         log_event(f"[CACHE] Loaded {len(dead_cache)} dead hashes.")
 
-    # 5. Filter fresh nodes
     fresh_links = []
     for l in raw_candidates:
         link_hash = get_md5(l)
         if link_hash not in dead_cache:
             fresh_links.append(l)
 
-    log_event(f"[PARSER] Filtering complete. {len(fresh_links)} unique fresh nodes to test.")
+    log_event(f"[PARSER] Filtering complete. {len(fresh_links)} fresh nodes to test.")
 
-    # 6. Prepare result files (ensure they exist)
     for rf in RESULT_FILES:
         if not os.path.exists(rf):
             with open(rf, "w") as f: pass
 
-    # 7. Parallel Testing Loop with Semaphore
+    # Batch Processing Logic
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
-    tasks = []
+    total_nodes = len(fresh_links)
     
-    # Dispatch tasks with rotating ports
-    for i, link in enumerate(fresh_links):
-        assigned_port = BASE_PORT + (i % MAX_CONCURRENT_TESTS)
-        tasks.append(audit_single_link(link, assigned_port, semaphore))
-
-    log_event(f"[SYSTEM] Dispatching {len(tasks)} parallel audit tasks (Concurrency: {MAX_CONCURRENT_TESTS})...")
-    
-    # Run all tasks and collect results
-    results = await asyncio.gather(*tasks)
-
-    # 8. Process and Save Results
-    for res_link, cat, speed in results:
-        if cat == "DEAD":
-            with open(DEAD_CACHE_FILE, "a") as f: 
-                f.write(get_md5(res_link) + "\n")
-        else:
-            fname = {
-                "ELITE": ELITE_GEMINI, 
-                "STABLE": STABLE_CHAT, 
-                "FAST_NO_GOOGLE": FAST_NO_GOOGLE
-            }.get(cat)
-            
-            if fname:
-                with open(fname, "a") as f:
-                    f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
+    for i in range(0, total_nodes, BATCH_SIZE):
+        batch = fresh_links[i : i + BATCH_SIZE]
+        log_event(f"[SYSTEM] Processing batch {i//BATCH_SIZE + 1} ({i+1}-{min(i+BATCH_SIZE, total_nodes)} of {total_nodes})")
+        
+        tasks = []
+        for j, link in enumerate(batch):
+            assigned_port = BASE_PORT + (j % MAX_CONCURRENT_TESTS)
+            tasks.append(audit_single_link(link, assigned_port, semaphore))
+        
+        # Execute current batch
+        batch_results = await asyncio.gather(*tasks)
+        
+        # Save batch results immediately to avoid data loss on crash
+        for res_link, cat, speed in batch_results:
+            if cat == "DEAD":
+                with open(DEAD_CACHE_FILE, "a") as f: 
+                    f.write(get_md5(res_link) + "\n")
+            else:
+                fname = {
+                    "ELITE": ELITE_GEMINI, 
+                    "STABLE": STABLE_CHAT, 
+                    "FAST_NO_GOOGLE": FAST_NO_GOOGLE
+                }.get(cat)
+                
+                if fname:
+                    with open(fname, "a") as f:
+                        f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
 
     log_event("--- SIERRA AUDIT COMPLETE ---")
 
 if __name__ == "__main__":
-    # Ensure binaries are executable
     try:
         if os.path.exists(LIBRESPEED_PATH):
             os.chmod(LIBRESPEED_PATH, 0o755)
