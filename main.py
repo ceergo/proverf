@@ -6,6 +6,8 @@ import asyncio
 import sys
 import re
 import aiohttp
+import hashlib
+import base64
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -14,21 +16,24 @@ from config import Config
 from logger import (
     stats, log_event, log_node_details, log_error_details, 
     log_progress, log_summary, kill_process_by_name, get_md5,
-    manage_cache_lifecycle, save_audit_results
+    manage_cache_lifecycle, save_audit_results, clean_garbage
 )
 
 # Global lock for file operations
 file_lock = asyncio.Lock()
 
-# --- DATA PARSING ---
+# --- DATA PARSING & CLEANING ---
 def parse_proxy_link(link):
-    """Converts raw URI to structured dict for Xray."""
+    """Converts raw URI to structured dict for Xray. Includes pre-cleaning."""
     try:
-        import base64
+        # Принудительная очистка от мусора перед парсингом
+        link = clean_garbage(link, Config.CLEANUP_PATTERN)
+        
         if link.lower().startswith("vmess://"):
             b64 = re.sub(r'[^a-zA-Z0-9+/=]', '', link[8:].split("#")[0])
             b64 += "=" * (-len(b64) % 4)
-            data = json.loads(re.search(r'\{.*\}', base64.b64decode(b64).decode('utf-8', errors='ignore')).group())
+            decoded = base64.b64decode(b64).decode('utf-8', errors='ignore')
+            data = json.loads(re.search(r'\{.*\}', decoded).group())
             return {
                 "protocol": "vmess", "host": data.get("add"), "port": int(data.get("port", 443)),
                 "uuid": data.get("id"), "sni": data.get("sni") or data.get("host", ""),
@@ -49,7 +54,6 @@ def parse_proxy_link(link):
                 "pbk": params.get("pbk", ""), "sid": params.get("sid", "")
             }
         elif link.lower().startswith("ss://"):
-            import base64
             parts = link[5:].split("#")
             main, remark = parts[0], (unquote(parts[1]) if len(parts) > 1 else "SS")
             if "@" in main:
@@ -67,15 +71,15 @@ def parse_proxy_link(link):
 
 # --- EXTERNAL POOL EXPANDER ---
 async def fetch_remote_links(url):
-    """Downloads content from remote URL and extracts proxy links."""
+    """Downloads content from remote URL and extracts proxy links with cleaning."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=15) as response:
                 if response.status == 200:
                     text = await response.text()
-                    # Basic extraction for common proxy protocols
-                    found = re.findall(r'(vmess|vless|trojan|ss|hy2)://[^\s\"\'<>]+', text)
-                    return found
+                    found = re.findall(Config.PROTOCOL_PATTERN, text, re.IGNORECASE)
+                    # Чистим каждую найденную ссылку
+                    return [clean_garbage(l, Config.CLEANUP_PATTERN) for l in found if l]
     except Exception as e:
         log_event(f"⚠️ Ошибка загрузки по ссылке {url}: {e}", "ERROR")
     return []
@@ -84,7 +88,7 @@ async def prepare_task_pool_advanced(config):
     """Reads raw_links.txt, follows http links, AND reads existing results to re-verify them."""
     pool = set()
     
-    # 1. Загрузка из raw_links.txt (локальные и удаленные)
+    # 1. Загрузка и очистка из raw_links.txt
     if os.path.exists(config.RAW_LINKS_FILE):
         with open(config.RAW_LINKS_FILE, 'r') as f:
             lines = [line.strip() for line in f if line.strip()]
@@ -93,19 +97,23 @@ async def prepare_task_pool_advanced(config):
         for entry in lines:
             if entry.startswith("http"):
                 remote_links = await fetch_remote_links(entry)
-                for rl in remote_links: pool.add(rl)
-            elif any(entry.startswith(p) for p in ["vmess://", "vless://", "trojan://", "ss://", "hy2://"]):
-                pool.add(entry)
+                for rl in remote_links: 
+                    cleaned = clean_garbage(rl, config.CLEANUP_PATTERN)
+                    if cleaned: pool.add(cleaned)
+            elif any(entry.lower().startswith(p) for p in ["vmess://", "vless://", "trojan://", "ss://", "hy2://"]):
+                cleaned = clean_garbage(entry, config.CLEANUP_PATTERN)
+                if cleaned: pool.add(cleaned)
 
-    # 2. Загрузка существующих "элиток" и "стабильных" для перепроверки
+    # 2. Загрузка существующих нод для перепроверки (чтобы обновить кэш и базу)
     log_event("🔍 Сбор ранее найденных нод для перепроверки...", "INFO")
     for category, filename in config.RESULT_FILES.items():
         if os.path.exists(filename):
             with open(filename, 'r') as f:
-                current_nodes = [line.strip() for line in f if line.strip()]
-                for cn in current_nodes: pool.add(cn)
+                for line in f:
+                    cleaned = clean_garbage(line.strip(), config.CLEANUP_PATTERN)
+                    if cleaned: pool.add(cleaned)
             
-    # Save a copy of the full pool for debugging
+    # Сохраняем слепок пула для отладки
     with open(config.TEMP_POOL_FILE, "w") as f:
         json.dump(list(pool), f)
         
@@ -172,7 +180,7 @@ async def measure_speed_librespeed(socks_port):
     return 0.0, 0.0
 
 async def audit_single_link(link, local_port, semaphore):
-    """Full lifecycle check for a single proxy link. Forced re-check enabled."""
+    """Full lifecycle check for a single proxy link."""
     async with semaphore:
         l_hash = get_md5(link)
         parsed = parse_proxy_link(link)
@@ -229,28 +237,29 @@ async def main_orchestrator():
         kill_process_by_name("xray")
         manage_cache_lifecycle(Config)
         
-        # 1. Формируем пул (новые + старые из файлов)
+        # 1. Формируем пул (всегда перепроверяем всё)
         total_pool = await prepare_task_pool_advanced(Config)
             
         if not total_pool: 
             log_event(f"🛑 Пул задач пуст. Проверьте {Config.RAW_LINKS_FILE}.", "ERROR")
             return
 
-        # 2. Очищаем файлы перед началом полной перезаписи
-        log_event("🧹 Подготовка к перезаписи актуальных баз...", "SYSTEM")
+        # 2. Очищаем файлы результатов перед записью свежих данных
+        log_event("🧹 Перезапись баз: очистка старых файлов...", "SYSTEM")
         for f_path in Config.RESULT_FILES.values():
             if os.path.exists(f_path): open(f_path, 'w').close()
 
+        # Также очищаем кэш мертвых, если мы хотим полную перепроверку каждые 4 часа
+        # Но для экономии ресурсов лучше оставить dead_cache на 72 часа (управляется manage_cache_lifecycle)
         dead_cache = set()
         if os.path.exists(Config.DEAD_CACHE_FILE):
             with open(Config.DEAD_CACHE_FILE) as f: dead_cache = {line.strip() for line in f}
         
-        # Фильтруем только по кэшу мертвых (который живет 72 часа)
         active_nodes = [l for l in total_pool if get_md5(l) not in dead_cache]
         stats.total = len(active_nodes)
         
         if not active_nodes:
-            log_event("📭 Все ноды в кэше мертвых. Ничего не осталось на проверку.", "INFO")
+            log_event("📭 Все ноды в кэше мертвых. Ждем ротации или новых ссылок.", "INFO")
             return
             
         semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_TESTS)
@@ -261,7 +270,7 @@ async def main_orchestrator():
             tasks = [audit_single_link(l, Config.BASE_PORT + (idx % Config.PORT_RANGE), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
             
-            # Сохраняем результаты (функция сохранит их в нужные файлы)
+            # Сохраняем результаты
             await save_audit_results(results, Config, file_lock)
             log_progress()
             
