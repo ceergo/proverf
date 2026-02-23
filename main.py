@@ -54,10 +54,17 @@ def log_event(msg):
 def get_md5(text):
     """
     Generates MD5 hash for unique identification.
-    Normalization: removes trailing # and whitespace.
+    Normalization: cuts off tails (# and ?) to ensure same node = same MD5.
     """
-    normalized = text.strip().split('#')[0].split('?')[0] if "vmess://" not in text else text.strip().split('#')[0]
-    return hashlib.md5(normalized.encode()).hexdigest()
+    try:
+        # For VMESS we cut only after #, for others we cut after # or ?
+        if "vmess://" in text:
+            normalized = text.strip().split('#')[0]
+        else:
+            normalized = text.strip().split('#')[0].split('?')[0]
+        return hashlib.md5(normalized.encode()).hexdigest()
+    except:
+        return hashlib.md5(text.strip().encode()).hexdigest()
 
 def manage_cache_lifecycle():
     """
@@ -107,25 +114,24 @@ def extract_server_identity(link):
 def clean_garbage(link):
     """
     Strict cleaning for ALL proxy protocols.
-    Removes trailing tags (#) and query params that cause MD5 mismatches.
+    Removes country codes (#RU), emojis, and ensures MD5 consistency.
     """
     if not link:
         return ""
     
-    # 1. Start from protocol
+    # 1. Find protocol start
     protocol_match = re.search(r'(vless|vmess|trojan|ss|hy2)://', link, re.IGNORECASE)
     if protocol_match:
         link = link[protocol_match.start():]
     
-    # 2. Kill whitespace
+    # 2. Remove whitespace
     link = "".join(link.split())
     
-    # 3. Remove trailing garbage like # or ? for non-vmess (vmess keeps its ps/name sometimes inside, so be careful)
-    # But for MD5 consistency, we cut the remark tag if it's external (#)
+    # 3. Cut off trailing remarks/names (the # suffix)
     if "#" in link:
         link = link.split("#")[0]
-        
-    # 4. ASCII filter
+    
+    # 4. Strict ASCII filter
     link = "".join(char for char in link if 31 < ord(char) < 127)
     
     return link
@@ -313,10 +319,24 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Full audit cycle with classification and atomic logging.
+    Full audit cycle with classification and Atomic Double-Check to prevent recursion.
     """
     async with semaphore:
-        proxy_id = get_md5(link)[:6]
+        # ATOMIC DOUBLE-CHECK: Проверяем файлы прямо перед запуском теста
+        # Если нода уже была записана другим потоком из этой же пачки - пропускаем.
+        link_md5 = get_md5(link)
+        already_done = False
+        for rf in RESULT_FILES:
+            if os.path.exists(rf):
+                with open(rf, "r") as f:
+                    if link_md5 in [get_md5(line) for line in f]:
+                        already_done = True
+                        break
+        
+        if already_done:
+            return link, "ALREADY_DONE", 0
+
+        proxy_id = link_md5[:6]
         report = [f"\n🚀 ТЕСТИРУЮ: {link}"]
         
         parsed = parse_proxy_link(link)
@@ -331,7 +351,7 @@ async def audit_single_link(link, local_port, semaphore):
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(6.0) 
+            await asyncio.sleep(6.5) 
             
             is_gemini, g_msg = await check_gemini_access(local_port)
             speed, ping = await measure_speed_librespeed(local_port)
@@ -373,47 +393,41 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main loop with strict normalization to prevent duplicate tests of the same node with different names/tags.
+    Main loop with Atomic Filtering and Batch protection.
     """
-    log_event("⚡ СИСТЕМА SIERRA: УЛЬТРА-ДЕДУПЛИКАЦИЯ ⚡")
+    log_event("⚡ СИСТЕМА SIERRA: ATOMIC DEDUPLICATION ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
         print(f"❌ Файл {RAW_LINKS_FILE} не найден.")
         return
 
-    # 1. Загружаем уже существующие MD5 (с нормализацией)
+    # 1. Загружаем базу MD5 из файлов (нормализованно)
     existing_hashes = set()
     for rf in RESULT_FILES:
         if os.path.exists(rf):
             with open(rf, "r") as f:
                 for line in f:
-                    l = line.strip()
-                    if "://" in l:
-                        existing_hashes.add(get_md5(l))
+                    if "://" in line:
+                        existing_hashes.add(get_md5(line))
 
-    # 2. Извлекаем из RAW файла
+    # 2. Читаем RAW и собираем подписки
     with open(RAW_LINKS_FILE, "r") as f:
         content = f.read()
     
     raw_found = extract_configs_from_text(content)
     sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
     
-    # 3. Собираем подписки
     print(f"🔗 Сбор из {len(sub_urls)} источников...", flush=True)
     fetched = await fetch_external_subs(sub_urls)
     
-    # 4. Нормализация и жесткая фильтрация
+    # 3. Единый Пул с первичной очисткой
+    total_pool = raw_found + fetched
     unique_candidates = []
-    seen_md5 = set()
+    seen_md5 = set(existing_hashes)
     seen_ips = set()
     
-    # Сначала добавляем то, что уже есть в итоговых файлах в seen_md5, чтобы не проверять
-    for h in existing_hashes:
-        seen_md5.add(h)
-
-    total_pool = raw_found + fetched
-    
+    # Жесткий фильтр перед нарезкой на пачки
     for link in total_pool:
         l_clean = clean_garbage(link)
         l_md5 = get_md5(l_clean)
@@ -424,34 +438,38 @@ async def main_orchestrator():
             seen_ips.add(l_ip)
             unique_candidates.append(l_clean)
 
-    print(f"\n💎 ВСЕГО В ПУЛЕ: {len(total_pool)} ссылок.")
-    print(f"🆕 РЕАЛЬНО НОВЫХ (БЕЗ ДУБЛЕЙ И IP-ПОВТОРОВ): {len(unique_candidates)}")
+    print(f"\n💎 В ПУЛЕ: {len(total_pool)} ссылок.")
+    print(f"🆕 К ПРОВЕРКЕ (УНИКАЛЬНЫХ): {len(unique_candidates)}")
 
-    # 5. Сверка с DEAD CACHE
+    # 4. Dead Cache Filter
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             dead_cache = {l.strip() for l in f if l.strip()}
 
     fresh = [l for l in unique_candidates if get_md5(l) not in dead_cache]
-    log_event(f"🚀 ИТОГО К ПРОВЕРКЕ: {len(fresh)}")
-
+    
     if not fresh:
-        log_event("✅ Новых ссылок для теста нет. Спим.")
+        log_event("✅ Новых нод нет. Завершаю.")
         sys.exit(0)
 
+    # Инициализируем файлы
     for rf in RESULT_FILES:
         if not os.path.exists(rf): open(rf, "w").close()
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
     
+    # 5. Тестирование пачками
     for i in range(0, len(fresh), BATCH_SIZE):
         batch = fresh[i : i + BATCH_SIZE]
         log_event(f"📦 ПАЧКА #{i//BATCH_SIZE + 1} ({len(batch)} нод)...")
         tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
         results = await asyncio.gather(*tasks)
         
+        # Сразу записываем результаты каждой пачки, чтобы Atomic Check в других потоках их видел
         for link, cat, speed in results:
+            if cat == "ALREADY_DONE": continue
+            
             l_md5 = get_md5(link)
             if cat == "DEAD":
                 with open(DEAD_CACHE_FILE, "a") as f:
@@ -459,10 +477,11 @@ async def main_orchestrator():
             else:
                 target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
                 if target:
+                    # Последняя проверка перед физической записью
                     with open(target, "a") as f:
                         f.write(f"{link}\n")
 
-    log_event("🏁 АУДИТ ЗАВЕРШЕН.")
+    log_event("🏁 ВСЁ ПРОВЕРЕНО.")
     sys.exit(0) 
 
 if __name__ == "__main__":
@@ -471,5 +490,5 @@ if __name__ == "__main__":
     except SystemExit:
         pass 
     except Exception as e:
-        log_event(f"🔴 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        log_event(f"🔴 КРИТИКАЛ: {e}")
         sys.exit(1)
