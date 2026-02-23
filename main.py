@@ -78,19 +78,46 @@ def manage_cache_lifecycle():
         with open(CLEANUP_LOG, "w") as f_out: 
             f_out.write(now.isoformat())
 
-def extract_server_identity(node_string):
+def extract_server_identity(link):
     """
-    Extracts Host:Port to identify the server.
+    Identifies server by Host:Port to prevent redundant testing.
     """
-    match = re.search(r'@([^:/]+):(\d+)', node_string)
-    if match:
-        return f"{match.group(1)}:{match.group(2)}"
-    return node_string
+    try:
+        if "://" not in link: return link
+        
+        if link.lower().startswith("vmess://"):
+            b64_part = link[8:].split("#")[0]
+            b64_part = re.sub(r'[^a-zA-Z0-9+/=]', '', b64_part)
+            b64_part += "=" * (-len(b64_part) % 4)
+            decoded = base64.b64decode(b64_part).decode('utf-8', errors='ignore')
+            data = json.loads(re.search(r'\{.*\}', decoded).group())
+            return f"{data.get('add')}:{data.get('port')}"
+        
+        match = re.search(r'@([^:/?#]+):(\d+)', link)
+        if match:
+            return f"{match.group(1)}:{match.group(2)}"
+            
+        parsed = urlparse(link)
+        return parsed.netloc or link
+    except:
+        return link
 
-def extract_configs_from_text(text):
+def clean_garbage(link):
     """
-    Linear Logic: Finds protocols and captures until whitespace or special char.
+    Removes emojis and junk from the end of the link.
     """
+    link = link.strip()
+    if link.lower().startswith("vmess://"):
+        if "#" in link:
+            return link.split("#")[0]
+    return link
+
+def extract_configs_from_text(text, depth=0):
+    """
+    Extracts proxy links with a recursion limit to prevent infinite loops.
+    """
+    if depth > 1: return []
+    
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
     text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ')
     
@@ -98,15 +125,18 @@ def extract_configs_from_text(text):
     matches = re.finditer(pattern, text, re.IGNORECASE)
     for m in matches:
         link = m.group(0).rstrip('.,;)]}>')
+        link = clean_garbage(link)
         if '@' in link or link.startswith('vmess://'):
             found_raw.append(link)
 
-    if not found_raw and len(text.strip()) > 50:
+    if not found_raw and len(text.strip()) > 50 and depth == 0:
         try:
-            padded = text.strip() + "=" * (-len(text.strip()) % 4)
-            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-            if any(p in decoded.lower() for p in ['vless://', 'vmess://', 'trojan://']):
-                return extract_configs_from_text(decoded)
+            potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
+            for chunk in potential_b64:
+                padded = chunk + "=" * (-len(chunk) % 4)
+                decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+                if any(p in decoded.lower() for p in ['vless://', 'vmess://', 'trojan://']):
+                    found_raw.extend(extract_configs_from_text(decoded, depth + 1))
         except:
             pass
 
@@ -138,11 +168,13 @@ def parse_proxy_link(link):
     """
     try:
         if link.lower().startswith("vmess://"):
-            parts = link[8:].split("#")
-            b64_part = re.sub(r'\s+', '', parts[0])
+            b64_part = link[8:].split("#")[0]
+            b64_part = re.sub(r'[^a-zA-Z0-9+/=]', '', b64_part)
             b64_part += "=" * (-len(b64_part) % 4)
             decoded_str = base64.b64decode(b64_part).decode('utf-8', errors='ignore').strip()
-            data = json.loads(re.search(r'\{.*\}', decoded_str, re.DOTALL).group())
+            json_match = re.search(r'\{.*\}', decoded_str, re.DOTALL)
+            if not json_match: return None
+            data = json.loads(json_match.group())
             return {
                 "protocol": "vmess", "host": data.get("add"), "port": int(data.get("port", 443)),
                 "uuid": data.get("id"), "sni": data.get("sni") or data.get("host", ""),
@@ -174,11 +206,12 @@ def parse_proxy_link(link):
                 method, password = auth.split(":")
                 h, p = hp.split(":")
             return {"protocol": "shadowsocks", "host": h, "port": int(p), "method": method, "password": password, "security": "none", "type": "tcp"}
-    except: return None
+    except Exception: 
+        return None
 
 def generate_xray_config(parsed_link, local_port):
     """
-    Xray config with ADVANCED DNS for Librespeed.
+    Xray config with DNS Fix.
     """
     protocol = parsed_link["protocol"]
     config = {
@@ -228,7 +261,7 @@ def generate_xray_config(parsed_link, local_port):
 
 async def check_gemini_access(socks_port):
     """
-    Check Gemini and handle codes.
+    Check Gemini access via SOCKS5 proxy.
     """
     try:
         cmd = ["curl", "-s", "-L", "-k", "--proxy", f"socks5h://127.0.0.1:{socks_port}", GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15", "-w", "%{http_code}"]
@@ -243,30 +276,37 @@ async def check_gemini_access(socks_port):
 
 async def measure_speed_librespeed(socks_port):
     """
-    Speed test with longer duration for stability.
+    Measure download speed using Librespeed CLI with extended timeout.
     """
     try:
-        cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "12"]
+        # Увеличиваем длительность теста и общий таймаут ожидания
+        cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "15"]
+        # Используем wait_for для предотвращения зависания процесса
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0:
-            data = json.loads(stdout.decode())
-            return round(data.get("download", 0) / 1024 / 1024, 2), round(data.get("ping", 0), 1)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+            if proc.returncode == 0:
+                data = json.loads(stdout.decode())
+                val = round(data.get("download", 0) / 1024 / 1024, 2)
+                return val, round(data.get("ping", 0), 1)
+        except asyncio.TimeoutError:
+            if proc: proc.kill()
+            return 0.0, 0.0
         return 0.0, 0.0
-    except: return 0.0, 0.0
+    except Exception: return 0.0, 0.0
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Full audit cycle with FULL LINK logging.
+    Full audit cycle with ATOMIC LOGGING and SPEED WARM-UP.
     """
     async with semaphore:
         proxy_id = get_md5(link)[:6]
-        # Прямо выводим всю ссылку, чтобы Босс мог её забрать
-        print(f"\n🚀 ТЕСТИРУЮ: {link}", flush=True)
+        report = [f"\n🚀 ТЕСТИРУЮ: {link}"]
         
         parsed = parse_proxy_link(link)
         if not parsed: 
-            print(f"  └─ ❌ ОШИБКА ПАРСИНГА (Битая ссылка)", flush=True)
+            report.append("  └─ ❌ ОШИБКА ПАРСИНГА")
+            print("\n".join(report), flush=True)
             return link, "DEAD", 0
         
         config_path = f"cfg_{proxy_id}_{local_port}.json"
@@ -275,24 +315,33 @@ async def audit_single_link(link, local_port, semaphore):
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(4.5)
+            await asyncio.sleep(6.0) # Прогрев Xray
             
+            # Проверка Gemini
             is_gemini, g_msg = await check_gemini_access(local_port)
+            
+            # Если Gemini работает, пробуем замерить скорость
             speed, ping = await measure_speed_librespeed(local_port)
             
             verdict = "МЕРТВАЯ 💀"
             emoji = "💀"
-            if is_gemini and speed >= 0.8: 
+            
+            # Логика определения категории
+            if speed >= 0.8 and is_gemini:
                 verdict = "ELITE ⭐"
                 emoji = "⭐"
-            elif is_gemini: 
+            elif is_gemini:
                 verdict = "STABLE 🟢"
                 emoji = "🟢"
-            elif speed >= 1.5: 
+            elif speed >= 1.0:
                 verdict = "FAST (No Google) ⚡"
                 emoji = "⚡"
+            elif speed > 0.05:
+                verdict = "STABLE 🟢"
+                emoji = "🟢"
             
-            print(f"  └─ {emoji} СТАТУС: {verdict} | СКОРОСТЬ: {speed} Mbps | GEMINI: {g_msg}", flush=True)
+            report.append(f"  └─ {emoji} СТАТУС: {verdict} | СКОРОСТЬ: {speed} Mbps | GEMINI: {g_msg}")
+            print("\n".join(report), flush=True)
             
             final_cat = "DEAD"
             if "ELITE" in verdict: final_cat = "ELITE"
@@ -300,7 +349,9 @@ async def audit_single_link(link, local_port, semaphore):
             elif "FAST" in verdict: final_cat = "FAST_NO_GOOGLE"
             
             return link, final_cat, speed
-        except: 
+        except Exception as e: 
+            report.append(f"  └─ 💀 СТАТУС: МЕРТВАЯ 💀 (ERROR: {str(e)[:20]})")
+            print("\n".join(report), flush=True)
             return link, "DEAD", 0
         finally:
             if xray_proc:
@@ -310,13 +361,13 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main engine with human-readable logs.
+    Main loop with server deduplication and atomic reporting.
     """
-    log_event("⚡ СИСТЕМА SIERRA ЗАПУЩЕНА (ЛИНЕЙНЫЙ РЕЖИМ) ⚡")
+    log_event("⚡ СИСТЕМА SIERRA ЗАПУЩЕНА (FIX: SPEED MEASUREMENT) ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
-        print(f"❌ Файл {RAW_LINKS_FILE} не найден. Нечего проверять.")
+        print(f"❌ Файл {RAW_LINKS_FILE} не найден.")
         return
 
     with open(RAW_LINKS_FILE, "r") as f:
@@ -325,19 +376,28 @@ async def main_orchestrator():
     raw_found = extract_configs_from_text(content)
     sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
     
-    print(f"🔗 Проверяю {len(sub_urls)} ссылок на подписки...", flush=True)
+    print(f"🔗 Сбор из {len(sub_urls)} источников...", flush=True)
     fetched = await fetch_external_subs(sub_urls)
     
-    all_candidates = list(set(raw_found + fetched))
-    print(f"\n💎 ВСЕГО НАЙДЕНО: {len(all_candidates)} уникальных ссылок", flush=True)
+    all_raw = list(set(raw_found + fetched))
+    seen_servers = set()
+    unique_candidates = []
+    
+    for link in all_raw:
+        identity = extract_server_identity(link)
+        if identity not in seen_servers:
+            seen_servers.add(identity)
+            unique_candidates.append(link)
+    
+    print(f"\n💎 ИТОГО: Найдено {len(all_raw)} ссылок. Уникальных IP:Port: {len(unique_candidates)}", flush=True)
 
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             dead_cache = {l.strip() for l in f if l.strip()}
 
-    fresh = [l for l in all_candidates if get_md5(l) not in dead_cache]
-    print(f"🆕 К проверке: {len(fresh)} нод (остальные уже в черном списке)\n", flush=True)
+    fresh = [l for l in unique_candidates if get_md5(l) not in dead_cache]
+    print(f"🆕 К проверке: {len(fresh)} нод\n", flush=True)
 
     for rf in RESULT_FILES:
         if not os.path.exists(rf): open(rf, "w").close()
@@ -358,7 +418,7 @@ async def main_orchestrator():
                     with open(target, "a") as f:
                         f.write(f"{link}\n")
 
-    print(f"\n✅ АУДИТ ЗАВЕРШЕН. РЕЗУЛЬТАТЫ В ФАЙЛАХ.")
+    print(f"\n✅ АУДИТ ЗАВЕРШЕН.")
 
 if __name__ == "__main__":
     asyncio.run(main_orchestrator())
