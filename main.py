@@ -81,31 +81,36 @@ async def fetch_remote_links(url):
     return []
 
 async def prepare_task_pool_advanced(config):
-    """Reads raw_links.txt, follows http links, and builds a complete pool."""
-    pool = []
-    if not os.path.exists(config.RAW_LINKS_FILE):
-        return []
-
-    with open(config.RAW_LINKS_FILE, 'r') as f:
-        lines = [line.strip() for line in f if line.strip()]
-
-    log_event("♻️ Анализ входных данных и развертывание ссылок...", "INFO")
+    """Reads raw_links.txt, follows http links, AND reads existing results to re-verify them."""
+    pool = set()
     
-    for entry in lines:
-        if entry.startswith("http"):
-            # It's a remote subscription or raw file
-            remote_links = await fetch_remote_links(entry)
-            pool.extend(remote_links)
-        elif any(entry.startswith(p) for p in ["vmess://", "vless://", "trojan://", "ss://", "hy2://"]):
-            # It's a direct proxy link
-            pool.append(entry)
-            
-    # Save a copy of the full pool for debugging/reference
-    with open(config.TEMP_POOL_FILE, "w") as f:
-        json.dump(pool, f)
+    # 1. Загрузка из raw_links.txt (локальные и удаленные)
+    if os.path.exists(config.RAW_LINKS_FILE):
+        with open(config.RAW_LINKS_FILE, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
         
-    log_event(f"📖 Загружено: {len(pool)} нод (включая развернутые ссылки).", "SUCCESS")
-    return list(set(pool)) # Deduplicate by raw string
+        log_event("♻️ Анализ входных данных и развертывание ссылок...", "INFO")
+        for entry in lines:
+            if entry.startswith("http"):
+                remote_links = await fetch_remote_links(entry)
+                for rl in remote_links: pool.add(rl)
+            elif any(entry.startswith(p) for p in ["vmess://", "vless://", "trojan://", "ss://", "hy2://"]):
+                pool.add(entry)
+
+    # 2. Загрузка существующих "элиток" и "стабильных" для перепроверки
+    log_event("🔍 Сбор ранее найденных нод для перепроверки...", "INFO")
+    for category, filename in config.RESULT_FILES.items():
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                current_nodes = [line.strip() for line in f if line.strip()]
+                for cn in current_nodes: pool.add(cn)
+            
+    # Save a copy of the full pool for debugging
+    with open(config.TEMP_POOL_FILE, "w") as f:
+        json.dump(list(pool), f)
+        
+    log_event(f"📖 Итого в очереди на аудит: {len(pool)} нод.", "SUCCESS")
+    return list(pool)
 
 # --- TESTING ENGINE ---
 def generate_xray_config(parsed, local_port):
@@ -167,28 +172,28 @@ async def measure_speed_librespeed(socks_port):
     return 0.0, 0.0
 
 async def audit_single_link(link, local_port, semaphore):
-    """Full lifecycle check for a single proxy link."""
+    """Full lifecycle check for a single proxy link. Forced re-check enabled."""
     async with semaphore:
         l_hash = get_md5(link)
-        async with file_lock:
-            for path in Config.RESULT_FILES.values():
-                if os.path.exists(path) and l_hash in open(path).read():
-                    stats.processed += 1
-                    return link, "ALREADY_DONE", 0, 0
         parsed = parse_proxy_link(link)
         if not parsed:
             stats.processed += 1; stats.dead += 1
             return link, "INVALID_FORMAT", 0, 0
+            
         config_path = f"cfg_{l_hash[:6]}_{local_port}.json"
         with open(config_path, "w") as f: json.dump(generate_xray_config(parsed, local_port), f)
+        
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([Config.XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             await asyncio.sleep(4)
+            
             is_gemini, gemini_code = await check_gemini_access(local_port)
             speed, ping = 0.0, 0.0
+            
             if is_gemini or (gemini_code not in ["ERR", "000"]):
                 speed, ping = await measure_speed_librespeed(local_port)
+            
             cat = "DEAD"
             if is_gemini and speed >= 0.8: cat = "ELITE"; stats.elite += 1
             elif is_gemini or (0.1 < speed < 1.0): cat = "STABLE"; stats.stable += 1
@@ -219,34 +224,44 @@ async def main_orchestrator():
             sys.exit(0)
             
     with open(Config.LOCK_FILE, "w") as f: f.write(str(os.getpid()))
+    
     try:
         kill_process_by_name("xray")
         manage_cache_lifecycle(Config)
         
-        # New advanced pool preparation that follows HTTP links
+        # 1. Формируем пул (новые + старые из файлов)
         total_pool = await prepare_task_pool_advanced(Config)
             
         if not total_pool: 
             log_event(f"🛑 Пул задач пуст. Проверьте {Config.RAW_LINKS_FILE}.", "ERROR")
             return
 
+        # 2. Очищаем файлы перед началом полной перезаписи
+        log_event("🧹 Подготовка к перезаписи актуальных баз...", "SYSTEM")
+        for f_path in Config.RESULT_FILES.values():
+            if os.path.exists(f_path): open(f_path, 'w').close()
+
         dead_cache = set()
         if os.path.exists(Config.DEAD_CACHE_FILE):
             with open(Config.DEAD_CACHE_FILE) as f: dead_cache = {line.strip() for line in f}
         
+        # Фильтруем только по кэшу мертвых (который живет 72 часа)
         active_nodes = [l for l in total_pool if get_md5(l) not in dead_cache]
         stats.total = len(active_nodes)
         
         if not active_nodes:
-            log_event("📭 Все ноды из пула уже в кэше мертвых или проверены.", "INFO")
+            log_event("📭 Все ноды в кэше мертвых. Ничего не осталось на проверку.", "INFO")
             return
             
         semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_TESTS)
         
+        # 3. Аудит батчами
         for i in range(0, len(active_nodes), Config.BATCH_SIZE):
             batch = active_nodes[i : i + Config.BATCH_SIZE]
             tasks = [audit_single_link(l, Config.BASE_PORT + (idx % Config.PORT_RANGE), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
+            
+            # Сохраняем результаты (функция сохранит их в нужные файлы)
             await save_audit_results(results, Config, file_lock)
             log_progress()
             
