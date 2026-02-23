@@ -1,1 +1,33 @@
-
+{
+  "FILES": {
+    "RAW_LINKS": "RAW_LINKS.TXT",
+    "DEAD_CACHE": "DEAD_CACHE.TXT",
+    "CLEANUP_LOG": "LAST_CLEANUP.TXT",
+    "TEMP_POOL": "TEMP_POOL.JSON",
+    "LOCK_FILE": "BOT.LOCK",
+    "RESULTS": {
+      "ELITE": "ELITE_GEMINI.TXT",
+      "STABLE": "STABLE_CHAT.TXT",
+      "FAST": "FAST_NOGOOGLE.TXT"
+    }
+  },
+  "BINARIES": {
+    "XRAY": "./xray",
+    "LIBRESPEED": "./librespeed-cli"
+  },
+  "NETWORK": {
+    "MAX_CONCURRENT": 5,
+    "BATCH_SIZE": 10,
+    "BASE_PORT": 10800,
+    "TIMEOUT_SUB": 45,
+    "XRAY_WAIT": 6.5
+  },
+  "THRESHOLDS": {
+    "SPEED_ELITE": 0.8,
+    "SPEED_STABLE": 0.02,
+    "SPEED_FAST": 1.0
+  },
+  "URLS": {
+    "GEMINI_CHECK": "https://aistudio.google.com/app"
+  }
+}
