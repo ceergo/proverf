@@ -139,7 +139,7 @@ async def check_url_anchor(link, rule):
     start = time.time()
     try:
         cmd = [
-            "curl", "-s", "-L", "--proxy", link, rule["url"],
+            "curl", "-s", "-L", "-k", "--proxy", link, rule["url"],
             "--connect-timeout", "10", "-m", "15",
             "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "-w", "%{url_effective}"
@@ -160,15 +160,21 @@ async def check_url_anchor(link, rule):
 async def measure_speed(link):
     start = time.time()
     try:
+        # Добавили флаг -w для проверки размера и кода ответа
         cmd = [
-            "curl", "-L", "--proxy", link, SPEED_TEST_URL,
-            "-o", "/dev/null", "-s", "--max-time", "20", "-w", "%{http_code}"
+            "curl", "-L", "-k", "--proxy", link, SPEED_TEST_URL,
+            "-o", "/dev/null", "-s", "--max-time", "20", 
+            "-w", "%{http_code}:%{size_download}"
         ]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
-        duration = time.time() - start
-        if stdout.decode().strip() == "200" and duration > 0:
-            return round(8 / duration, 2)
+        res_data = stdout.decode().strip().split(':')
+        
+        if len(res_data) == 2:
+            code, size = res_data[0], int(res_data[1])
+            duration = time.time() - start
+            if code == "200" and size > 100000: # Минимум 100КБ для засчета скорости
+                return round((size * 8) / (duration * 1000000), 2) # Mbps
         return 0
     except: return 0
 
@@ -176,7 +182,7 @@ async def async_headless_audit(link):
     proxy_id = get_md5(link)[:8]
     log_event(f"[AUDIT:{proxy_id}] >>> PROBING: {link[:50]}...")
     
-    # 1. Speed
+    # 1. Speed (First check, if 0 - likely dead/fake)
     speed = await measure_speed(link)
     log_event(f"  [>] Speed: {speed} Mbps")
     
@@ -194,11 +200,11 @@ async def async_headless_audit(link):
 
     # Final Verdict
     category = "DEAD"
-    if gemini_ok and ai_studio['status'] == "OK" and speed >= 15:
+    if gemini_ok and ai_studio['status'] == "OK" and speed >= 10:
         category = "ELITE"
-    elif gemini_ok and speed >= 0.5:
+    elif gemini_ok and speed >= 0.1:
         category = "STABLE"
-    elif speed >= 10:
+    elif speed >= 5:
         category = "FAST_NO_GOOGLE"
 
     log_event(f"[AUDIT:{proxy_id}] VERDICT: {category}\n")
