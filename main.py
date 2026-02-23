@@ -138,9 +138,11 @@ async def load_and_expand_links():
 async def check_url_anchor(link, rule):
     start = time.time()
     try:
+        # Added --noproxy "" and -x to force proxy usage and avoid bypasses
         cmd = [
             "curl", "-s", "-L", "-k", "--proxy", link, rule["url"],
             "--connect-timeout", "10", "-m", "15",
+            "--noproxy", "",
             "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "-w", "%{url_effective}"
         ]
@@ -160,10 +162,11 @@ async def check_url_anchor(link, rule):
 async def measure_speed(link):
     start = time.time()
     try:
-        # Добавили флаг -w для проверки размера и кода ответа
+        # Проверка размера скачивания важна, чтобы отсечь фейковые ответы
         cmd = [
             "curl", "-L", "-k", "--proxy", link, SPEED_TEST_URL,
             "-o", "/dev/null", "-s", "--max-time", "20", 
+            "--noproxy", "",
             "-w", "%{http_code}:%{size_download}"
         ]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -173,7 +176,7 @@ async def measure_speed(link):
         if len(res_data) == 2:
             code, size = res_data[0], int(res_data[1])
             duration = time.time() - start
-            if code == "200" and size > 100000: # Минимум 100КБ для засчета скорости
+            if code == "200" and size > 50000: # Порог в 50КБ, чтобы не считать мелкие ошибки за успех
                 return round((size * 8) / (duration * 1000000), 2) # Mbps
         return 0
     except: return 0
@@ -182,7 +185,7 @@ async def async_headless_audit(link):
     proxy_id = get_md5(link)[:8]
     log_event(f"[AUDIT:{proxy_id}] >>> PROBING: {link[:50]}...")
     
-    # 1. Speed (First check, if 0 - likely dead/fake)
+    # 1. Speed (First check)
     speed = await measure_speed(link)
     log_event(f"  [>] Speed: {speed} Mbps")
     
