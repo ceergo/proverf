@@ -134,37 +134,70 @@ def clean_garbage(link):
     if not link:
         return ""
     
+    # Remove all whitespace and handle protocol start
+    link = link.strip()
     protocol_match = re.search(r'(vless|vmess|trojan|ss|hy2)://', link, re.IGNORECASE)
     if protocol_match:
         link = link[protocol_match.start():]
     
-    link = "".join(link.split())
-    if "#" in link:
-        link = link.split("#")[0]
+    # Remove invisible characters but keep base64/params
+    link = "".join(char for char in link if ord(char) > 32 and ord(char) < 127)
     
-    link = "".join(char for char in link if 31 < ord(char) < 127)
+    # Note: We don't split by '#' here if it's VMESS or contains encoded data
+    # only if it looks like a standard remark tail
+    if not link.lower().startswith("vmess://") and "#" in link:
+        # Check if # is followed by typical remark characters
+        parts = link.split("#", 1)
+        link = parts[0]
+        
     return link
 
 def extract_configs_from_text(text, depth=0):
     """
-    Extracts proxy links with a recursion limit.
+    Optimized extractor: Handles RAW lists, Base64 and mixed text.
     """
     if depth > 1: return []
     
+    # Flexible pattern for proxy protocols
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
-    text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ').replace('|', ' ')
+    
+    # Clean up common delimiters that break regex
+    clean_text = text.replace('\\n', '\n').replace('\\r', '\r')
     
     found_raw = []
-    matches = re.finditer(pattern, text, re.IGNORECASE)
+    
+    # 1. Direct Regex Search
+    matches = re.finditer(pattern, clean_text, re.IGNORECASE)
     for m in matches:
-        link = m.group(0).rstrip('.,;)]}>')
+        link = m.group(0).strip()
+        # Clean trailing punctuation from text blocks
+        link = re.sub(r'[.,;)]}$]+$', '', link)
         link = clean_garbage(link)
-        if '@' in link or link.startswith('vmess://'):
+        if link:
             found_raw.append(link)
 
-    if not found_raw and len(text.strip()) > 50 and depth == 0:
+    # 2. Line-by-Line fallback for RAW lists (like GitHub raw)
+    if not found_raw or len(found_raw) < 5:
+        lines = clean_text.splitlines()
+        for line in lines:
+            line = line.strip()
+            if any(proto in line.lower() for proto in ['vless://', 'vmess://', 'trojan://', 'ss://', 'hy2://']):
+                link = clean_garbage(line)
+                if link: found_raw.append(link)
+
+    # 3. Base64 Detection (Full page or chunks)
+    if depth == 0:
         try:
-            potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
+            # Try to decode the whole block if it looks like a subscription
+            if not any(p in clean_text.lower() for p in ['://']):
+                padded = clean_text.strip() + "=" * (-len(clean_text.strip()) % 4)
+                try:
+                    decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+                    found_raw.extend(extract_configs_from_text(decoded, depth + 1))
+                except: pass
+            
+            # Find base64 chunks in mixed text
+            potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', clean_text)
             for chunk in potential_b64:
                 padded = chunk + "=" * (-len(chunk) % 4)
                 try:
@@ -182,19 +215,24 @@ async def fetch_external_subs(urls):
     Downloads subscription content and extracts clean links.
     """
     all_links = []
-    timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=10)
+    timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=20)
     async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
         for url in urls:
             url = url.strip()
             if not url.startswith('http'): continue
+            log_event(f"📡 Загрузка: {url[:60]}...")
             try:
                 async with session.get(url, allow_redirects=True) as resp:
                     if resp.status == 200:
                         content = await resp.text()
-                        found = extract_configs_from_text(content)
-                        all_links.extend(found)
-            except:
-                pass
+                        if content:
+                            found = extract_configs_from_text(content)
+                            log_event(f"✅ Найдено {len(found)} нод в подписке.")
+                            all_links.extend(found)
+                    else:
+                        log_event(f"⚠️ Ошибка {resp.status} для {url[:30]}")
+            except Exception as e:
+                log_event(f"❌ Ошибка загрузки {url[:30]}: {str(e)}")
     return all_links
 
 def parse_proxy_link(link):
@@ -407,18 +445,22 @@ async def main_orchestrator():
                 return
             
             with open(RAW_LINKS_FILE, "r") as f: content = f.read()
-            sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
+            # Extract subscription URLs (http links)
+            sub_urls = [l.strip() for l in content.split() if l.strip().startswith('http')]
             
             log_event(f"🌐 Сбор подписок: {len(sub_urls)} URL...")
             fetched = await fetch_external_subs(sub_urls)
             
+            # Combine raw links from file + fetched links
             pool = list(set(extract_configs_from_text(content) + fetched))
             
             existing_hashes = set()
             for rf in RESULT_FILES:
                 if os.path.exists(rf):
                     with open(rf, "r") as f:
-                        for line in f: existing_hashes.add(get_md5(line))
+                        for line in f: 
+                            h = get_md5(line)
+                            if h: existing_hashes.add(h)
             
             seen_ips = set()
             for link in pool:
