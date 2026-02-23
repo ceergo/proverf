@@ -9,6 +9,7 @@ import sys
 import base64
 import shutil
 import random
+import signal
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs, unquote
 import aiohttp
@@ -17,6 +18,8 @@ import aiohttp
 RAW_LINKS_FILE = "raw_links.txt"
 DEAD_CACHE_FILE = "dead_cache.txt"
 CLEANUP_LOG = "last_cleanup.txt"
+TEMP_POOL_FILE = "temp_pool.json" 
+LOCK_FILE = "bot.lock" 
 
 # Output files
 ELITE_GEMINI = "Elite_Gemini.txt"
@@ -25,8 +28,10 @@ FAST_NO_GOOGLE = "Fast_NoGoogle.txt"
 
 RESULT_FILES = [ELITE_GEMINI, STABLE_CHAT, FAST_NO_GOOGLE]
 
-# Paths for Binaries
+# Paths for Binaries - ALIGNED WITH GITHUB WORKFLOW
+# Xray installed via script goes to /usr/local/bin, so we use global command
 XRAY_PATH = "xray" 
+# Librespeed downloaded locally in workflow
 LIBRESPEED_PATH = "./librespeed-cli" 
 
 # Critical Links
@@ -40,8 +45,6 @@ BASE_PORT = 10800
 # Browser Emulation Headers
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
 }
 
 def log_event(msg):
@@ -51,13 +54,24 @@ def log_event(msg):
     timestamp = datetime.now().strftime('%H:%M:%S')
     print(f"[{timestamp}] {msg}", flush=True)
 
+def kill_process_by_name(name):
+    """
+    Forcefully kills any leftover processes to free ports.
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/IM", f"{name}.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["pkill", "-9", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except:
+        pass
+
 def get_md5(text):
     """
     Generates MD5 hash for unique identification.
     Normalization: cuts off tails (# and ?) to ensure same node = same MD5.
     """
     try:
-        # For VMESS we cut only after #, for others we cut after # or ?
         if "vmess://" in text:
             normalized = text.strip().split('#')[0]
         else:
@@ -114,31 +128,24 @@ def extract_server_identity(link):
 def clean_garbage(link):
     """
     Strict cleaning for ALL proxy protocols.
-    Removes country codes (#RU), emojis, and ensures MD5 consistency.
     """
     if not link:
         return ""
     
-    # 1. Find protocol start
     protocol_match = re.search(r'(vless|vmess|trojan|ss|hy2)://', link, re.IGNORECASE)
     if protocol_match:
         link = link[protocol_match.start():]
     
-    # 2. Remove whitespace
     link = "".join(link.split())
-    
-    # 3. Cut off trailing remarks/names (the # suffix)
     if "#" in link:
         link = link.split("#")[0]
     
-    # 4. Strict ASCII filter
     link = "".join(char for char in link if 31 < ord(char) < 127)
-    
     return link
 
 def extract_configs_from_text(text, depth=0):
     """
-    Extracts proxy links with a recursion limit and applies clean_garbage immediately.
+    Extracts proxy links with a recursion limit.
     """
     if depth > 1: return []
     
@@ -168,10 +175,10 @@ def extract_configs_from_text(text, depth=0):
 
 async def fetch_external_subs(urls):
     """
-    Downloads subscription content and extracts clean links.
+    Downloads subscription content and extracts clean links with strict timeouts.
     """
     all_links = []
-    timeout = aiohttp.ClientTimeout(total=45)
+    timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=10)
     async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout) as session:
         for url in urls:
             url = url.strip()
@@ -182,7 +189,7 @@ async def fetch_external_subs(urls):
                         content = await resp.text()
                         found = extract_configs_from_text(content)
                         all_links.extend(found)
-            except Exception:
+            except:
                 pass
     return all_links
 
@@ -230,33 +237,27 @@ def parse_proxy_link(link):
                 method, password = auth.split(":")
                 h, p = hp.split(":")
             return {"protocol": "shadowsocks", "host": h, "port": int(p), "method": method, "password": password, "security": "none", "type": "tcp"}
-    except Exception: 
+    except: 
         return None
 
 def generate_xray_config(parsed_link, local_port):
     """
-    Xray config with optimized DNS and routing for testing.
+    Xray config with optimized DNS and routing.
     """
     protocol = parsed_link["protocol"]
     config = {
         "log": {"loglevel": "none"},
-        "dns": {
-            "servers": ["8.8.8.8", "1.1.1.1", "localhost"],
-            "queryStrategy": "UseIPv4"
-        },
+        "dns": {"servers": ["8.8.8.8", "1.1.1.1"], "queryStrategy": "UseIPv4"},
         "routing": {
             "domainStrategy": "AsIs",
-            "rules": [
-                {"type": "field", "outboundTag": "proxy", "network": "udp,tcp"},
-                {"type": "field", "outboundTag": "direct", "domain": ["localhost"]}
-            ]
+            "rules": [{"type": "field", "outboundTag": "proxy", "network": "udp,tcp"}]
         },
         "inbounds": [{
             "port": local_port, "protocol": "socks",
             "settings": {"auth": "noauth", "udp": True},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         }],
-        "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {}}]
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}]
     }
 
     if protocol == "hy2":
@@ -265,7 +266,7 @@ def generate_xray_config(parsed_link, local_port):
     else:
         out = {"tag": "proxy", "protocol": protocol, "settings": {}, "streamSettings": {"network": parsed_link.get("type", "tcp"), "security": parsed_link.get("security", "none")}}
         if protocol in ["vless", "vmess"]:
-            user = {"id": parsed_link["uuid"], "encryption": "none"} if protocol == "vless" else {"id": parsed_link["uuid"], "alterId": 0, "security": "auto"}
+            user = {"id": parsed_link["uuid"], "encryption": "none"} if protocol == "vless" else {"id": parsed_link["uuid"], "alterId": 0}
             out["settings"]["vnext"] = [{"address": parsed_link["host"], "port": parsed_link["port"], "users": [user]}]
         elif protocol == "trojan":
             out["settings"]["servers"] = [{"address": parsed_link["host"], "port": parsed_link["port"], "password": parsed_link["uuid"]}]
@@ -285,106 +286,73 @@ def generate_xray_config(parsed_link, local_port):
 
 async def check_gemini_access(socks_port):
     """
-    Check if Google AI Studio is accessible via proxy.
+    Check Gemini access via SOCKS5h.
     """
     try:
         cmd = ["curl", "-s", "-L", "-k", "--proxy", f"socks5h://127.0.0.1:{socks_port}", GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15", "-w", "%{http_code}"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
-        
-        if "200" in res or "302" in res: return True, "ДОСТУПНО ✅"
-        if "403" in res: return False, "БЛОК 🛑"
-        return False, f"ОТВЕТ: {res[:3]}"
-    except: return False, "ОШИБКА ❌"
+        return ("200" in res or "302" in res), res
+    except: return False, "ERR"
 
 async def measure_speed_librespeed(socks_port):
     """
-    Speed test with extended timeout for slow but working nodes.
+    Speed test via Librespeed CLI.
     """
     try:
+        if not os.path.exists(LIBRESPEED_PATH):
+            return 0.0, 0.0
+            
         cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "15"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
             if proc.returncode == 0:
                 data = json.loads(stdout.decode())
-                val = round(data.get("download", 0) / 1024 / 1024, 2)
-                return val, round(data.get("ping", 0), 1)
-        except asyncio.TimeoutError:
+                return round(data.get("download", 0) / 1024 / 1024, 2), round(data.get("ping", 0), 1)
+        except:
             if proc: proc.kill()
-            return 0.0, 0.0
         return 0.0, 0.0
-    except Exception: return 0.0, 0.0
+    except: return 0.0, 0.0
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Full audit cycle with classification and Atomic Double-Check to prevent recursion.
+    Audit process for a single proxy node.
     """
     async with semaphore:
-        # ATOMIC DOUBLE-CHECK: Проверяем файлы прямо перед запуском теста
-        # Если нода уже была записана другим потоком из этой же пачки - пропускаем.
         link_md5 = get_md5(link)
-        already_done = False
+        
+        # Atomic Double Check
         for rf in RESULT_FILES:
             if os.path.exists(rf):
                 with open(rf, "r") as f:
-                    if link_md5 in [get_md5(line) for line in f]:
-                        already_done = True
-                        break
-        
-        if already_done:
-            return link, "ALREADY_DONE", 0
-
-        proxy_id = link_md5[:6]
-        report = [f"\n🚀 ТЕСТИРУЮ: {link}"]
+                    if any(link_md5 in line for line in f): return link, "ALREADY_DONE", 0
         
         parsed = parse_proxy_link(link)
-        if not parsed: 
-            report.append("  └─ ❌ ОШИБКА ПАРСИНГА")
-            print("\n".join(report), flush=True)
-            return link, "DEAD", 0
+        if not parsed: return link, "DEAD", 0
         
-        config_path = f"cfg_{proxy_id}_{local_port}.json"
+        config_path = f"cfg_{link_md5[:5]}_{local_port}.json"
         with open(config_path, "w") as f: json.dump(generate_xray_config(parsed, local_port), f)
             
         xray_proc = None
         try:
+            # We assume 'xray' is in system PATH (installed via official script)
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             await asyncio.sleep(6.5) 
             
             is_gemini, g_msg = await check_gemini_access(local_port)
             speed, ping = await measure_speed_librespeed(local_port)
             
-            verdict = "МЕРТВАЯ 💀"
-            emoji = "💀"
+            cat = "DEAD"
+            if is_gemini and speed >= 0.8: cat = "ELITE"
+            elif is_gemini or speed > 0.02: cat = "STABLE"
+            elif speed >= 1.0: cat = "FAST_NO_GOOGLE"
             
-            if is_gemini and speed >= 0.8:
-                verdict = "ELITE ⭐"
-                emoji = "⭐"
-            elif is_gemini:
-                verdict = "STABLE 🟢" 
-                emoji = "🟢"
-            elif speed >= 1.0:
-                verdict = "FAST (No Google) ⚡"
-                emoji = "⚡"
-            elif speed > 0.02:
-                verdict = "STABLE 🟢"
-                emoji = "🟢"
-            
-            report.append(f"  └─ {emoji} СТАТУС: {verdict} | СКОРОСТЬ: {speed} Mbps | GEMINI: {g_msg}")
-            print("\n".join(report), flush=True)
-            
-            final_cat = "DEAD"
-            if "ELITE" in verdict: final_cat = "ELITE"
-            elif "STABLE" in verdict: final_cat = "STABLE"
-            elif "FAST" in verdict: final_cat = "FAST_NO_GOOGLE"
-            
-            return link, final_cat, speed
+            log_event(f"Node {link_md5[:6]} -> {cat} ({speed} Mbps)")
+            return link, cat, speed
         except Exception as e: 
-            report.append(f"  └─ 💀 СТАТУС: МЕРТВАЯ 💀 (ERROR: {str(e)[:20]})")
-            print("\n".join(report), flush=True)
-            return link, "DEAD", 0
+            return link, f"ERROR: {str(e)[:20]}", 0
         finally:
             if xray_proc:
                 xray_proc.kill()
@@ -393,102 +361,98 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main loop with Atomic Filtering and Batch protection.
+    Main loop with recursion and loop prevention.
     """
-    log_event("⚡ СИСТЕМА SIERRA: ATOMIC DEDUPLICATION ⚡")
-    manage_cache_lifecycle()
+    if os.path.exists(LOCK_FILE):
+        mtime = os.path.getmtime(LOCK_FILE)
+        if time.time() - mtime < 600: 
+            print("🚫 СИСТЕМА ЗАБЛОКИРОВАНА: Процесс уже идет.")
+            sys.exit(0)
     
-    if not os.path.exists(RAW_LINKS_FILE): 
-        print(f"❌ Файл {RAW_LINKS_FILE} не найден.")
-        return
-
-    # 1. Загружаем базу MD5 из файлов (нормализованно)
-    existing_hashes = set()
-    for rf in RESULT_FILES:
-        if os.path.exists(rf):
-            with open(rf, "r") as f:
-                for line in f:
-                    if "://" in line:
-                        existing_hashes.add(get_md5(line))
-
-    # 2. Читаем RAW и собираем подписки
-    with open(RAW_LINKS_FILE, "r") as f:
-        content = f.read()
+    with open(LOCK_FILE, "w") as f: f.write(str(os.getpid()))
     
-    raw_found = extract_configs_from_text(content)
-    sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
-    
-    print(f"🔗 Сбор из {len(sub_urls)} источников...", flush=True)
-    fetched = await fetch_external_subs(sub_urls)
-    
-    # 3. Единый Пул с первичной очисткой
-    total_pool = raw_found + fetched
-    unique_candidates = []
-    seen_md5 = set(existing_hashes)
-    seen_ips = set()
-    
-    # Жесткий фильтр перед нарезкой на пачки
-    for link in total_pool:
-        l_clean = clean_garbage(link)
-        l_md5 = get_md5(l_clean)
-        l_ip = extract_server_identity(l_clean)
-        
-        if l_md5 not in seen_md5 and l_ip not in seen_ips:
-            seen_md5.add(l_md5)
-            seen_ips.add(l_ip)
-            unique_candidates.append(l_clean)
+    try:
+        log_event("🛑 ПРИНУДИТЕЛЬНАЯ ОЧИСТКА ПОРТОВ...")
+        kill_process_by_name("xray")
+        manage_cache_lifecycle()
 
-    print(f"\n💎 В ПУЛЕ: {len(total_pool)} ссылок.")
-    print(f"🆕 К ПРОВЕРКЕ (УНИКАЛЬНЫХ): {len(unique_candidates)}")
+        # 2. LOAD SNAPSHOT OR FETCH
+        total_candidates = []
+        if os.path.exists(TEMP_POOL_FILE):
+            log_event("♻️ Загрузка из Снапшота...")
+            with open(TEMP_POOL_FILE, "r") as f: total_candidates = json.load(f)
 
-    # 4. Dead Cache Filter
-    dead_cache = set()
-    if os.path.exists(DEAD_CACHE_FILE):
-        with open(DEAD_CACHE_FILE, "r") as f:
-            dead_cache = {l.strip() for l in f if l.strip()}
-
-    fresh = [l for l in unique_candidates if get_md5(l) not in dead_cache]
-    
-    if not fresh:
-        log_event("✅ Новых нод нет. Завершаю.")
-        sys.exit(0)
-
-    # Инициализируем файлы
-    for rf in RESULT_FILES:
-        if not os.path.exists(rf): open(rf, "w").close()
-
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
-    
-    # 5. Тестирование пачками
-    for i in range(0, len(fresh), BATCH_SIZE):
-        batch = fresh[i : i + BATCH_SIZE]
-        log_event(f"📦 ПАЧКА #{i//BATCH_SIZE + 1} ({len(batch)} нод)...")
-        tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
-        results = await asyncio.gather(*tasks)
-        
-        # Сразу записываем результаты каждой пачки, чтобы Atomic Check в других потоках их видел
-        for link, cat, speed in results:
-            if cat == "ALREADY_DONE": continue
+        if not total_candidates:
+            if not os.path.exists(RAW_LINKS_FILE): 
+                log_event("❌ RAW_LINKS_FILE не найден.")
+                return
+            with open(RAW_LINKS_FILE, "r") as f: content = f.read()
             
-            l_md5 = get_md5(link)
-            if cat == "DEAD":
-                with open(DEAD_CACHE_FILE, "a") as f:
-                    f.write(l_md5 + "\n")
-            else:
-                target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
-                if target:
-                    # Последняя проверка перед физической записью
-                    with open(target, "a") as f:
-                        f.write(f"{link}\n")
+            sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
+            fetched = await fetch_external_subs(sub_urls)
+            
+            pool = list(set(extract_configs_from_text(content) + fetched))
+            existing_hashes = set()
+            for rf in RESULT_FILES:
+                if os.path.exists(rf):
+                    with open(rf, "r") as f:
+                        for line in f: existing_hashes.add(get_md5(line))
+            
+            seen_ips = set()
+            for link in pool:
+                l_md5 = get_md5(link)
+                l_ip = extract_server_identity(link)
+                if l_md5 not in existing_hashes and l_ip not in seen_ips:
+                    total_candidates.append(link)
+                    seen_ips.add(l_ip)
+            
+            with open(TEMP_POOL_FILE, "w") as f: json.dump(total_candidates, f)
 
-    log_event("🏁 ВСЁ ПРОВЕРЕНО.")
-    sys.exit(0) 
+        # 3. DEAD CACHE FILTER
+        dead_cache = set()
+        if os.path.exists(DEAD_CACHE_FILE):
+            with open(DEAD_CACHE_FILE, "r") as f: dead_cache = {l.strip() for l in f}
+
+        fresh = [l for l in total_candidates if get_md5(l) not in dead_cache]
+        log_event(f"🔍 К ПРОВЕРКЕ: {len(fresh)}")
+
+        if not fresh:
+            if os.path.exists(TEMP_POOL_FILE): os.remove(TEMP_POOL_FILE)
+            log_event("✅ Новых нод нет.")
+            return
+
+        # 4. TESTING BATCHES
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
+        for i in range(0, len(fresh), BATCH_SIZE):
+            batch = fresh[i : i + BATCH_SIZE]
+            tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
+            results = await asyncio.gather(*tasks)
+            
+            for link, cat, speed in results:
+                if cat == "ALREADY_DONE": continue
+                l_md5 = get_md5(link)
+                if "ERROR" in cat or cat == "DEAD":
+                    with open(DEAD_CACHE_FILE, "a") as f: f.write(l_md5 + "\n")
+                else:
+                    target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
+                    if target:
+                        with open(target, "a") as f: f.write(f"{link}\n")
+            
+            # Save progress after batch
+            with open(TEMP_POOL_FILE, "w") as f: json.dump(fresh[i+BATCH_SIZE:], f)
+
+        log_event("🏁 ФИНИШ.")
+        if os.path.exists(TEMP_POOL_FILE): os.remove(TEMP_POOL_FILE)
+
+    finally:
+        if os.path.exists(LOCK_FILE): os.remove(LOCK_FILE)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_orchestrator())
-    except SystemExit:
-        pass 
+    except SystemExit: pass
+    except KeyboardInterrupt: pass
     except Exception as e:
-        log_event(f"🔴 КРИТИКАЛ: {e}")
+        log_event(f"🔴 CRASH: {e}")
+        if os.path.exists(LOCK_FILE): os.remove(LOCK_FILE)
         sys.exit(1)
