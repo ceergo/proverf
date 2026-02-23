@@ -8,6 +8,7 @@ import re
 import sys
 import base64
 import shutil
+import random
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs, unquote
 import aiohttp
@@ -30,6 +31,10 @@ LIBRESPEED_PATH = "./librespeed-cli"
 
 # Critical Links
 GEMINI_CHECK_URL = "https://aistudio.google.com/app"
+
+# Concurrency & Networking
+MAX_CONCURRENT_TESTS = 5  # Number of parallel Xray instances
+BASE_PORT = 10800         # Starting port for local SOCKS5 proxies
 
 # Browser Emulation Headers
 HEADERS = {
@@ -386,6 +391,7 @@ async def check_gemini_access(socks_port):
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         res = stdout.decode().strip()
+        # 200 is direct access, 302 often indicates a redirect to login which is also good sign of reachability
         return (True, "OK") if "200" in res or "302" in res else (False, f"HTTP_{res}")
     except Exception as e:
         return False, f"Error: {str(e)[:20]}"
@@ -411,62 +417,73 @@ async def measure_speed_librespeed(socks_port):
     except:
         return 0.0, 0.0
 
-async def audit_single_link(link, local_port):
+async def audit_single_link(link, local_port, semaphore):
     """
-    Complete audit cycle for a single node.
+    Complete audit cycle for a single node with concurrency control.
     """
-    proxy_id = get_md5(link)[:8]
-    parsed = parse_proxy_link(link)
-    
-    if not parsed: 
-        return link, "DEAD", 0
-    
-    config = generate_xray_config(parsed, local_port)
-    config_path = f"config_{proxy_id}.json"
-    
-    with open(config_path, "w") as f: 
-        json.dump(config, f)
+    async with semaphore:
+        # Random randomization to prevent burst requests to target servers
+        await asyncio.sleep(random.uniform(1.0, 3.0))
         
-    xray_proc = None
-    try:
-        xray_proc = subprocess.Popen(
-            [XRAY_PATH, "-c", config_path], 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL
-        )
-        await asyncio.sleep(4.0) # Buffer for Xray core initialization
+        proxy_id = get_md5(link)[:8]
+        parsed = parse_proxy_link(link)
         
-        is_gemini, g_msg = await check_gemini_access(local_port)
-        speed, ping = await measure_speed_librespeed(local_port)
+        if not parsed: 
+            return link, "DEAD", 0
         
-        verdict = "DEAD"
-        if is_gemini and speed >= 1.0: 
-            verdict = "ELITE"
-        elif is_gemini: 
-            verdict = "STABLE"
-        elif speed >= 2.5: 
-            verdict = "FAST_NO_GOOGLE"
+        config = generate_xray_config(parsed, local_port)
+        config_path = f"config_{proxy_id}_{local_port}.json"
         
-        log_event(f"[{proxy_id}] {verdict} | {speed}Mbps | {g_msg} | {parsed['protocol'].upper()}")
-        
-        xray_proc.terminate()
-        xray_proc.wait()
-        if os.path.exists(config_path): os.remove(config_path)
-        
-        return link, verdict, speed
-        
-    except Exception:
-        if xray_proc: 
+        with open(config_path, "w") as f: 
+            json.dump(config, f)
+            
+        xray_proc = None
+        try:
+            # Launch Xray core
+            xray_proc = subprocess.Popen(
+                [XRAY_PATH, "-c", config_path], 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+            await asyncio.sleep(5.0) # Buffer for Xray core and handshake initialization
+            
+            # Step 1: Gemini Check
+            is_gemini, g_msg = await check_gemini_access(local_port)
+            
+            # Step 2: Speed Check
+            speed, ping = await measure_speed_librespeed(local_port)
+            
+            # Step 3: Categorization logic
+            verdict = "DEAD"
+            if is_gemini and speed >= 1.0: 
+                verdict = "ELITE"
+            elif is_gemini: 
+                verdict = "STABLE"
+            elif speed >= 2.5: 
+                verdict = "FAST_NO_GOOGLE"
+            
+            log_event(f"[{proxy_id}|Port:{local_port}] {verdict} | {speed}Mbps | {g_msg} | {parsed['protocol'].upper()}")
+            
+            # Cleanup
             xray_proc.terminate()
             xray_proc.wait()
-        if os.path.exists(config_path): os.remove(config_path)
-        return link, "DEAD", 0
+            if os.path.exists(config_path): os.remove(config_path)
+            
+            return link, verdict, speed
+            
+        except Exception as e:
+            log_event(f"[{proxy_id}] Critical failure: {e}")
+            if xray_proc: 
+                xray_proc.terminate()
+                xray_proc.wait()
+            if os.path.exists(config_path): os.remove(config_path)
+            return link, "DEAD", 0
 
 async def main_orchestrator():
     """
-    The main engine: loads sources, downloads content, filters cache, and audits nodes.
+    The main engine: loads sources, downloads content, filters cache, and audits nodes in parallel.
     """
-    log_event("--- SIERRA X-RAY ORCHESTRATOR ONLINE ---")
+    log_event("--- SIERRA X-RAY PARALLEL ORCHESTRATOR ONLINE ---")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE):
@@ -509,36 +526,42 @@ async def main_orchestrator():
 
     log_event(f"[PARSER] Filtering complete. {len(fresh_links)} unique fresh nodes to test.")
 
-    # 6. Prepare result files
+    # 6. Prepare result files (ensure they exist)
     for rf in RESULT_FILES:
         if not os.path.exists(rf):
             with open(rf, "w") as f: pass
 
-    # 7. Testing Loop
-    base_port = 10808
+    # 7. Parallel Testing Loop with Semaphore
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
+    tasks = []
+    
+    # Dispatch tasks with rotating ports
     for i, link in enumerate(fresh_links):
-        log_event(f"[PROGRESS] Testing node {i+1}/{len(fresh_links)}...")
-        try:
-            res_link, cat, speed = await audit_single_link(link, base_port)
-            
-            if cat == "DEAD":
-                with open(DEAD_CACHE_FILE, "a") as f: 
-                    f.write(get_md5(res_link) + "\n")
-            else:
-                fname = {
-                    "ELITE": ELITE_GEMINI, 
-                    "STABLE": STABLE_CHAT, 
-                    "FAST_NO_GOOGLE": FAST_NO_GOOGLE
-                }.get(cat)
-                
-                if fname:
-                    with open(fname, "a") as f:
-                        f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
-        except Exception as e:
-            log_event(f"[CRITICAL LOOP ERROR] {e}")
-            continue
+        assigned_port = BASE_PORT + (i % MAX_CONCURRENT_TESTS)
+        tasks.append(audit_single_link(link, assigned_port, semaphore))
 
-    log_event("--- AUDIT COMPLETE ---")
+    log_event(f"[SYSTEM] Dispatching {len(tasks)} parallel audit tasks (Concurrency: {MAX_CONCURRENT_TESTS})...")
+    
+    # Run all tasks and collect results
+    results = await asyncio.gather(*tasks)
+
+    # 8. Process and Save Results
+    for res_link, cat, speed in results:
+        if cat == "DEAD":
+            with open(DEAD_CACHE_FILE, "a") as f: 
+                f.write(get_md5(res_link) + "\n")
+        else:
+            fname = {
+                "ELITE": ELITE_GEMINI, 
+                "STABLE": STABLE_CHAT, 
+                "FAST_NO_GOOGLE": FAST_NO_GOOGLE
+            }.get(cat)
+            
+            if fname:
+                with open(fname, "a") as f:
+                    f.write(f"{res_link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%d.%m %H:%M')}\n")
+
+    log_event("--- SIERRA AUDIT COMPLETE ---")
 
 if __name__ == "__main__":
     # Ensure binaries are executable
@@ -547,7 +570,7 @@ if __name__ == "__main__":
             os.chmod(LIBRESPEED_PATH, 0o755)
         if os.path.exists(XRAY_PATH):
             os.chmod(XRAY_PATH, 0o755)
-    except:
-        pass
+    except Exception as e:
+        log_event(f"[BIN-WARN] Chmod failed: {e}")
         
     asyncio.run(main_orchestrator())
