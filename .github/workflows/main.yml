@@ -17,34 +17,47 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip wget curl
+
       - name: Install Xray-core (Direct Binary)
         run: |
-          # Download official Xray binary directly to avoid root install scripts
-          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          # More robust way to get the latest tag name
+          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          # Fallback if jq is not available or fails
+          if [ "$XRAY_VERSION" == "null" ] || [ -z "$XRAY_VERSION" ]; then
+            XRAY_VERSION="v24.12.31" # Stable fallback
+          fi
+          
           echo "Installing Xray $XRAY_VERSION"
-          wget https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-linux-64.zip
-          unzip Xray-linux-64.zip
+          wget -O xray.zip https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-linux-64.zip
+          unzip -o xray.zip xray
           chmod +x xray
-          # Move to a directory in PATH or use local path
           sudo mv xray /usr/local/bin/xray
           xray -version
 
       - name: Install Librespeed CLI
         run: |
           # Download latest release from Librespeed
-          curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
+          LATEST_URL=$(curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
           | grep "browser_download_url.*linux_amd64.tar.gz" \
           | cut -d : -f 2,3 \
-          | tr -d \" \
-          | wget -qi -
-          tar -xzf *.tar.gz
+          | tr -d \" | xargs)
+          
+          wget -O librespeed.tar.gz $LATEST_URL
+          tar -xzf librespeed.tar.gz
           # Locate the binary and make it executable
           find . -name "librespeed-cli*" -exec mv {} librespeed-cli \;
           chmod +x librespeed-cli
           ./librespeed-cli --version
 
       - name: Run Sieve Orchestrator
-        run: python main.py
+        run: |
+          # Install python requirements if they exist
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python main.py
 
       - name: Commit and Push Results
         run: |
