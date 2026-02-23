@@ -9,6 +9,7 @@ import sys
 import base64
 import shutil
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs, unquote
 import aiohttp
 
 # --- CONFIGURATION ---
@@ -54,16 +55,21 @@ def manage_cache_lifecycle():
 
 def extract_configs_from_text(text):
     """Extracts proxy links and handles Base64 decoding if necessary."""
-    # Attempt to decode Base64 if the whole block looks like it
+    results = []
+    
+    # Try decoding as a whole block first
     try:
-        decoded = base64.b64decode(text.strip()).decode('utf-8')
-        text = decoded
+        decoded = base64.b64decode(text.strip()).decode('utf-8', errors='ignore')
+        if "://" in decoded:
+            text = decoded
     except:
         pass
         
-    pattern = r'(vless|vmess|ss|trojan)://[^\s|#]+(?:#[^\s]*)?'
+    pattern = r'(vless|vmess|ss|trojan)://[^\s|#\^]+(?:#[^\s]*)?'
     found = re.findall(pattern, text, re.IGNORECASE)
-    return list(set(found))
+    results.extend(found)
+    
+    return list(set(results))
 
 async def fetch_external_subs(urls):
     """Downloads content from external subscription URLs."""
@@ -83,28 +89,71 @@ async def fetch_external_subs(urls):
                 log_event(f"  [!] Failed to fetch sub: {e}")
     return all_links
 
-def parse_vless_link(link):
+def parse_proxy_link(link):
+    """Advanced parser for VLESS and VMESS protocols."""
     try:
-        # Simple extraction for VLESS
-        pattern = r'vless://([^@]+)@([^:]+):(\d+)\?([^#]+)'
-        match = re.match(pattern, link)
-        if not match: return None
-        
-        uuid, host, port, query = match.groups()
-        params = dict(re.findall(r'([^&=]+)=([^&]*)', query))
-        
-        return {
-            "uuid": uuid,
-            "host": host,
-            "port": int(port),
-            "sni": params.get("sni", host),
-            "path": params.get("path", "/"),
-            "security": params.get("security", "none"),
-            "type": params.get("type", "tcp")
-        }
-    except: return None
+        if link.startswith("vmess://"):
+            # VMESS is usually base64 encoded JSON
+            b64_data = link.replace("vmess://", "").split("#")[0]
+            # Fix padding if needed
+            b64_data += "=" * (-len(b64_data) % 4)
+            data = json.loads(base64.b64decode(b64_data).decode('utf-8'))
+            return {
+                "protocol": "vmess",
+                "host": data.get("add"),
+                "port": int(data.get("port", 443)),
+                "uuid": data.get("id"),
+                "sni": data.get("sni") or data.get("host", ""),
+                "path": data.get("path", "/"),
+                "security": data.get("tls", "none"),
+                "type": data.get("net", "tcp"),
+                "aid": data.get("aid", 0),
+                "remark": data.get("ps", "Unnamed")
+            }
+            
+        elif link.startswith("vless://"):
+            parsed = urlparse(link)
+            netloc = parsed.netloc
+            if "@" not in netloc: return None
+            
+            # Extract User Info and Host/Port
+            user_info, host_port = netloc.split("@")
+            uuid = user_info
+            
+            # Handle cases with or without explicit port
+            if ":" in host_port:
+                host, port = host_port.split(":")
+                port = int(port)
+            else:
+                host = host_port
+                port = 443
+            
+            # Parse Query Params
+            params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            
+            return {
+                "protocol": "vless",
+                "uuid": uuid,
+                "host": host,
+                "port": port,
+                "sni": params.get("sni", ""),
+                "path": params.get("path", "/"),
+                "security": params.get("security", "none"),
+                "type": params.get("type", "tcp"),
+                "flow": params.get("flow", ""),
+                "pbk": params.get("pbk", ""),
+                "sid": params.get("sid", ""),
+                "fp": params.get("fp", "chrome")
+            }
+    except Exception as e:
+        return None
+    return None
 
 def generate_xray_config(parsed_link, local_port):
+    """Generates a specialized JSON config for Xray based on protocol and security."""
+    protocol = parsed_link["protocol"]
+    
+    # Base configuration
     config = {
         "log": {"loglevel": "none"},
         "inbounds": [{
@@ -113,23 +162,64 @@ def generate_xray_config(parsed_link, local_port):
             "settings": {"auth": "noauth", "udp": True},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
         }],
-        "outbounds": [{
-            "protocol": "vless",
-            "settings": {
-                "vnext": [{
-                    "address": parsed_link["host"],
-                    "port": parsed_link["port"],
-                    "users": [{"id": parsed_link["uuid"], "encryption": "none"}]
-                }]
-            },
-            "streamSettings": {
-                "network": parsed_link["type"],
-                "security": parsed_link["security"],
-                "tlsSettings": {"serverName": parsed_link["sni"]} if parsed_link["security"] == "tls" else {},
-                "wsSettings": {"path": parsed_link["path"]} if parsed_link["type"] == "ws" else {}
-            }
-        }]
+        "outbounds": []
     }
+
+    # Outbound settings
+    outbound = {
+        "protocol": protocol,
+        "settings": {
+            "vnext": [{
+                "address": parsed_link["host"],
+                "port": parsed_link["port"],
+                "users": []
+            }]
+        },
+        "streamSettings": {
+            "network": parsed_link["type"],
+            "security": parsed_link["security"]
+        }
+    }
+
+    # Protocol-specific User object
+    user = {"id": parsed_link["uuid"]}
+    if protocol == "vless":
+        user["encryption"] = "none"
+        if parsed_link.get("flow"):
+            user["flow"] = parsed_link["flow"]
+    elif protocol == "vmess":
+        user["alterId"] = parsed_link.get("aid", 0)
+        user["security"] = "auto"
+    
+    outbound["settings"]["vnext"][0]["users"].append(user)
+
+    # Stream Settings (Transport & Security)
+    ss = outbound["streamSettings"]
+    
+    # 1. Transport Logic
+    if parsed_link["type"] == "ws":
+        ss["wsSettings"] = {"path": parsed_link["path"]}
+    elif parsed_link["type"] == "grpc":
+        ss["grpcSettings"] = {"serviceName": parsed_link.get("path", "")}
+
+    # 2. Security Logic (Reality / TLS)
+    if parsed_link["security"] == "reality":
+        ss["realitySettings"] = {
+            "show": False,
+            "fingerprint": parsed_link.get("fp", "chrome"),
+            "serverName": parsed_link.get("sni", ""),
+            "publicKey": parsed_link.get("pbk", ""),
+            "shortId": parsed_link.get("sid", ""),
+            "spiderX": ""
+        }
+    elif parsed_link["security"] == "tls":
+        ss["tlsSettings"] = {
+            "serverName": parsed_link.get("sni", ""),
+            "allowInsecure": True,
+            "fingerprint": parsed_link.get("fp", "chrome")
+        }
+
+    config["outbounds"].append(outbound)
     return config
 
 async def check_gemini_access(socks_port):
@@ -149,7 +239,6 @@ async def check_gemini_access(socks_port):
 
 async def measure_speed_librespeed(socks_port):
     try:
-        # Template for librespeed-cli via socks
         cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "5"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
@@ -162,8 +251,9 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port):
     proxy_id = get_md5(link)[:8]
-    parsed = parse_vless_link(link)
-    if not parsed: return link, "DEAD", 0
+    parsed = parse_proxy_link(link)
+    if not parsed: 
+        return link, "DEAD", 0
     
     config = generate_xray_config(parsed, local_port)
     config_path = f"config_{proxy_id}.json"
@@ -181,12 +271,13 @@ async def audit_single_link(link, local_port):
         elif is_gemini: verdict = "STABLE"
         elif speed >= 3.0: verdict = "FAST_NO_GOOGLE"
         
-        log_event(f"[{proxy_id}] {verdict} | {speed}Mbps | {g_msg}")
+        log_event(f"[{proxy_id}] {verdict} | {speed}Mbps | {g_msg} | {parsed['protocol'].upper()}")
         
         xray_proc.terminate()
         os.remove(config_path)
         return link, verdict, speed
     except:
+        if 'xray_proc' in locals(): xray_proc.terminate()
         return link, "DEAD", 0
 
 async def main_orchestrator():
@@ -200,11 +291,9 @@ async def main_orchestrator():
     with open(RAW_LINKS_FILE, "r") as f:
         lines = [l.strip() for l in f if l.strip()]
     
-    # 1. Separate URLs from direct configs
     sub_urls = [l for l in lines if l.startswith('http')]
     direct_configs = [l for l in lines if '://' in l and not l.startswith('http')]
     
-    # 2. Fetch external subs
     fetched_links = await fetch_external_subs(sub_urls)
     total_candidates = list(set(direct_configs + fetched_links))
     
