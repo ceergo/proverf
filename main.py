@@ -104,30 +104,21 @@ def extract_server_identity(link):
 
 def clean_garbage(link):
     """
-    Universal deep cleaning for ALL proxy protocols.
-    Removes emojis, whitespaces, and hidden control characters that break Xray.
+    Strict cleaning for ALL proxy protocols.
+    Removes emojis, country flags, and ANY non-ASCII characters everywhere.
+    Ensures the link is 100% safe for Xray binary.
     """
-    link = link.strip()
-    # 1. Remove any whitespace, newlines or tabs
-    link = re.split(r'\s+', link)[0]
+    if not link:
+        return ""
     
-    if "://" not in link:
-        return link
-        
-    protocol, rest = link.split("://", 1)
+    # 1. Remove all whitespaces and invisible control characters
+    link = "".join(link.split())
     
-    # 2. Handle remarks (parts after #) separately to allow Unicode there but not in the URI
-    if "#" in rest:
-        body, remark = rest.split("#", 1)
-        # Body (the actual connection data) must be pure ASCII (removes emojis)
-        body = re.sub(r'[^\x21-\x7E]', '', body)
-        # Remark can have Unicode but no control characters
-        remark = re.sub(r'[\x00-\x1F\x7F]', '', remark)
-        return f"{protocol}://{body}#{remark}"
-    else:
-        # No remark, entire rest of the link must be pure ASCII
-        rest = re.sub(r'[^\x21-\x7E]', '', rest)
-        return f"{protocol}://{rest}"
+    # 2. Strict ASCII filter: Keep only characters from space (32) to ~ (126)
+    # This automatically kills emojis, flags (like 🇬🇧), and special unicode.
+    link = "".join(char for char in link if 31 < ord(char) < 127)
+    
+    return link
 
 def extract_configs_from_text(text, depth=0):
     """
@@ -345,7 +336,7 @@ async def audit_single_link(link, local_port, semaphore):
                 verdict = "ELITE ⭐"
                 emoji = "⭐"
             elif is_gemini:
-                verdict = "STABLE 🟢" # Living node with access but low speed
+                verdict = "STABLE 🟢" 
                 emoji = "🟢"
             elif speed >= 1.0:
                 verdict = "FAST (No Google) ⚡"
@@ -377,7 +368,7 @@ async def main_orchestrator():
     """
     Main orchestration loop with atomic deduplication and forced exit.
     """
-    log_event("⚡ СИСТЕМА SIERRA: ПОЛНЫЙ ЦИКЛ С ОЧИСТКОЙ МУСОРА ⚡")
+    log_event("⚡ СИСТЕМА SIERRA: УЛЬТРА-ОЧИСТКА (ASCII ONLY) ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
@@ -405,7 +396,6 @@ async def main_orchestrator():
     seen_servers = set()
     unique_candidates = []
     
-    # Strictly deduplicate by IP:Port and check against current elite/stable files
     for link in all_raw:
         identity = extract_server_identity(link)
         link_md5 = get_md5(link)
