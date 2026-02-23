@@ -177,28 +177,40 @@ async def main_orchestrator():
         log_event("🚀 СТАРТ: Режим локального аудита", "SYSTEM")
         kill_process_by_name("xray")
         manage_cache_lifecycle(Config)
+        
+        # --- CLEANUP: Explicitly remove temp pool to avoid stuck states ---
+        if os.path.exists(Config.TEMP_POOL_FILE):
+            os.remove(Config.TEMP_POOL_FILE)
+
+        # Always prepare fresh pool from raw_links.txt
         total_pool = await prepare_task_pool(Config)
-        if not total_pool: return
+            
+        if not total_pool: 
+            log_event(f"🛑 Очередь пуста. Проверьте входной файл: {Config.RAW_LINKS_FILE}", "ERROR")
+            return
+
         dead_cache = set()
         if os.path.exists(Config.DEAD_CACHE_FILE):
             with open(Config.DEAD_CACHE_FILE) as f: dead_cache = {line.strip() for line in f}
+        
         active_nodes = [l for l in total_pool if get_md5(l) not in dead_cache]
         stats.total = len(active_nodes)
+        
         if not active_nodes:
-            log_event("📭 Очередь пуста.", "INFO")
-            if os.path.exists(Config.TEMP_POOL_FILE): os.remove(Config.TEMP_POOL_FILE)
+            log_event("📭 Все ноды в очереди уже проверены или помечены как мертвые.", "INFO")
             return
+            
         log_event(f"🏁 Запуск аудита {stats.total} нод...", "SYSTEM")
         semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_TESTS)
+        
         for i in range(0, len(active_nodes), Config.BATCH_SIZE):
             batch = active_nodes[i : i + Config.BATCH_SIZE]
             tasks = [audit_single_link(l, Config.BASE_PORT + (idx % Config.PORT_RANGE), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
             await save_audit_results(results, Config, file_lock)
-            with open(Config.TEMP_POOL_FILE, "w") as f: json.dump(active_nodes[i + Config.BATCH_SIZE:], f)
             log_progress()
+            
         log_summary()
-        if os.path.exists(Config.TEMP_POOL_FILE): os.remove(Config.TEMP_POOL_FILE)
     finally:
         if os.path.exists(Config.LOCK_FILE): os.remove(Config.LOCK_FILE)
 
