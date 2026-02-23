@@ -104,9 +104,11 @@ def extract_server_identity(link):
 
 def clean_garbage(link):
     """
-    Deep cleaning for ALL protocols. Removes emojis from URI and control chars from tags.
+    Universal deep cleaning for ALL proxy protocols.
+    Removes emojis, whitespaces, and hidden control characters that break Xray.
     """
     link = link.strip()
+    # 1. Remove any whitespace, newlines or tabs
     link = re.split(r'\s+', link)[0]
     
     if "://" not in link:
@@ -114,18 +116,22 @@ def clean_garbage(link):
         
     protocol, rest = link.split("://", 1)
     
+    # 2. Handle remarks (parts after #) separately to allow Unicode there but not in the URI
     if "#" in rest:
         body, remark = rest.split("#", 1)
+        # Body (the actual connection data) must be pure ASCII (removes emojis)
         body = re.sub(r'[^\x21-\x7E]', '', body)
+        # Remark can have Unicode but no control characters
         remark = re.sub(r'[\x00-\x1F\x7F]', '', remark)
         return f"{protocol}://{body}#{remark}"
     else:
+        # No remark, entire rest of the link must be pure ASCII
         rest = re.sub(r'[^\x21-\x7E]', '', rest)
         return f"{protocol}://{rest}"
 
 def extract_configs_from_text(text, depth=0):
     """
-    Extracts proxy links with a recursion limit to prevent infinite loops.
+    Extracts proxy links with a recursion limit and applies clean_garbage immediately.
     """
     if depth > 1: return []
     
@@ -136,10 +142,12 @@ def extract_configs_from_text(text, depth=0):
     matches = re.finditer(pattern, text, re.IGNORECASE)
     for m in matches:
         link = m.group(0).rstrip('.,;)]}>')
+        # Apply strict cleaning immediately
         link = clean_garbage(link)
         if '@' in link or link.startswith('vmess://'):
             found_raw.append(link)
 
+    # Base64 nested extraction
     if not found_raw and len(text.strip()) > 50 and depth == 0:
         try:
             potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
@@ -155,7 +163,7 @@ def extract_configs_from_text(text, depth=0):
 
 async def fetch_external_subs(urls):
     """
-    Downloads subscription content.
+    Downloads subscription content and extracts clean links.
     """
     all_links = []
     timeout = aiohttp.ClientTimeout(total=45)
@@ -222,7 +230,7 @@ def parse_proxy_link(link):
 
 def generate_xray_config(parsed_link, local_port):
     """
-    Xray config with DNS Fix.
+    Xray config with optimized DNS and routing for testing.
     """
     protocol = parsed_link["protocol"]
     config = {
@@ -272,7 +280,7 @@ def generate_xray_config(parsed_link, local_port):
 
 async def check_gemini_access(socks_port):
     """
-    Check Gemini access via SOCKS5 proxy.
+    Check if Google AI Studio is accessible via proxy.
     """
     try:
         cmd = ["curl", "-s", "-L", "-k", "--proxy", f"socks5h://127.0.0.1:{socks_port}", GEMINI_CHECK_URL, "--connect-timeout", "10", "-m", "15", "-w", "%{http_code}"]
@@ -287,7 +295,7 @@ async def check_gemini_access(socks_port):
 
 async def measure_speed_librespeed(socks_port):
     """
-    Measure download speed using Librespeed CLI with extended 25s timeout.
+    Speed test with extended timeout for slow but working nodes.
     """
     try:
         cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "15"]
@@ -306,7 +314,7 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Full audit cycle with global cleaning and speed fallback logic.
+    Full audit cycle with classification and atomic logging.
     """
     async with semaphore:
         proxy_id = get_md5(link)[:6]
@@ -324,22 +332,20 @@ async def audit_single_link(link, local_port, semaphore):
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(6.0) # Warm-up
+            await asyncio.sleep(6.0) # Grace period
             
-            # Gemini Check
             is_gemini, g_msg = await check_gemini_access(local_port)
-            
-            # Speed Check
             speed, ping = await measure_speed_librespeed(local_port)
             
             verdict = "МЕРТВАЯ 💀"
             emoji = "💀"
             
+            # Smart Classification
             if is_gemini and speed >= 0.8:
                 verdict = "ELITE ⭐"
                 emoji = "⭐"
             elif is_gemini:
-                verdict = "STABLE 🟢"
+                verdict = "STABLE 🟢" # Living node with access but low speed
                 emoji = "🟢"
             elif speed >= 1.0:
                 verdict = "FAST (No Google) ⚡"
@@ -369,22 +375,22 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main loop with atomic reporting and GUARANTEED EXIT.
+    Main orchestration loop with atomic deduplication and forced exit.
     """
-    log_event("⚡ СИСТЕМА SIERRA: ЗАПУСК ПОЛНОГО ЦИКЛА ⚡")
+    log_event("⚡ СИСТЕМА SIERRA: ПОЛНЫЙ ЦИКЛ С ОЧИСТКОЙ МУСОРА ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
         print(f"❌ Файл {RAW_LINKS_FILE} не найден.")
         return
 
-    # Загружаем текущие найденные ноды, чтобы не дублировать в файлы
-    existing_nodes = set()
+    # Loading existing good nodes to skip duplicate testing
+    existing_hashes = set()
     for rf in RESULT_FILES:
         if os.path.exists(rf):
             with open(rf, "r") as f:
                 for line in f:
-                    if "://" in line: existing_nodes.add(get_md5(line.strip()))
+                    if "://" in line: existing_hashes.add(get_md5(line.strip()))
 
     with open(RAW_LINKS_FILE, "r") as f:
         content = f.read()
@@ -399,14 +405,15 @@ async def main_orchestrator():
     seen_servers = set()
     unique_candidates = []
     
+    # Strictly deduplicate by IP:Port and check against current elite/stable files
     for link in all_raw:
         identity = extract_server_identity(link)
         link_md5 = get_md5(link)
-        if identity not in seen_servers and link_md5 not in existing_nodes:
+        if identity not in seen_servers and link_md5 not in existing_hashes:
             seen_servers.add(identity)
             unique_candidates.append(link)
     
-    print(f"\n💎 ИТОГО: Найдено {len(all_raw)} ссылок. К проверке (уникальные): {len(unique_candidates)}", flush=True)
+    print(f"\n💎 ИТОГО: Найдено {len(all_raw)} ссылок. Уникальных для теста: {len(unique_candidates)}", flush=True)
 
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
@@ -414,7 +421,7 @@ async def main_orchestrator():
             dead_cache = {l.strip() for l in f if l.strip()}
 
     fresh = [l for l in unique_candidates if get_md5(l) not in dead_cache]
-    print(f"🆕 Свежих нод для теста: {len(fresh)}\n", flush=True)
+    print(f"🆕 Свежих нод для проверки: {len(fresh)}\n", flush=True)
 
     if not fresh:
         log_event("✅ Новых ссылок для проверки нет. Завершаю работу.")
@@ -425,14 +432,13 @@ async def main_orchestrator():
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
     
-    # Обработка
     for i in range(0, len(fresh), BATCH_SIZE):
         batch = fresh[i : i + BATCH_SIZE]
         log_event(f"📦 ПАЧКА #{i//BATCH_SIZE + 1} ({len(batch)} нод)...")
         tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
         results = await asyncio.gather(*tasks)
         
-        # Атомарная запись результатов после каждой пачки
+        # Immediate save and flush after each batch
         for link, cat, speed in results:
             if cat == "DEAD":
                 with open(DEAD_CACHE_FILE, "a") as f:
@@ -447,14 +453,14 @@ async def main_orchestrator():
                         f.flush()
                         os.fsync(f.fileno())
 
-    log_event("🏁 АУДИТ ПОЛНОСТЬЮ ЗАВЕРШЕН. ВЫХОД.")
-    sys.exit(0) # Гарантированный выход из процесса
+    log_event("🏁 АУДИТ ПОЛНОСТЬЮ ЗАВЕРШЕН. ГАРАНТИРОВАННЫЙ ВЫХОД.")
+    sys.exit(0) 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_orchestrator())
     except SystemExit:
-        pass # Корректный выход через sys.exit
+        pass 
     except Exception as e:
         log_event(f"🔴 КРИТИЧЕСКАЯ ОШИБКА: {e}")
         sys.exit(1)
