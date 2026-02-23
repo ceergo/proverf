@@ -5,6 +5,8 @@ import hashlib
 import time
 import asyncio
 import re
+import sys
+import base64
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
@@ -38,6 +40,11 @@ SPEED_TEST_URL = "https://cachefly.cachefly.net/1mb.test"
 
 MAX_CONCURRENT_PROXIES = 100 
 
+def log_event(msg):
+    """Real-time logging for GitHub Actions."""
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    print(f"[{timestamp}] {msg}", flush=True)
+
 def get_md5(text):
     return hashlib.md5(text.encode()).hexdigest()
 
@@ -47,6 +54,7 @@ def remove_proxy_from_all_files(proxy_link):
         try:
             with open(file_path, "r") as f:
                 lines = f.readlines()
+            # Фильтруем строку, если она содержит прокси-ссылку
             new_lines = [l for l in lines if proxy_link not in l]
             if len(lines) != len(new_lines):
                 with open(file_path, "w") as f:
@@ -60,7 +68,7 @@ def manage_cache_lifecycle():
             try:
                 last_run = datetime.fromisoformat(f.read().strip())
                 if now - last_run > timedelta(hours=72):
-                    print(f"[{now.strftime('%H:%M:%S')}] [CLEANUP] 72h reached. Wiping old data...")
+                    log_event("[CLEANUP] 72h cycle! Wiping dead_cache and starting fresh audit...")
                     if os.path.exists(DEAD_CACHE_FILE): os.remove(DEAD_CACHE_FILE)
                     for f_name in RESULT_FILES:
                         if os.path.exists(f_name): open(f_name, 'w').close()
@@ -70,58 +78,61 @@ def manage_cache_lifecycle():
         with open(CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
 
 def extract_configs_from_text(text):
-    """
-    Parses raw text to find proxy-like strings (vmess, vless, ss, trojan, etc.)
-    """
-    # Regex for common proxy protocols
-    pattern = r'(vless|vmess|ss|trojan|ssr)://[^\s|#]+'
+    # Regex to find proxy links
+    pattern = r'(vless|vmess|ss|trojan|ssr)://[^\s|#]+(?:#[^\s]*)?'
     found = re.findall(pattern, text, re.IGNORECASE)
     return list(set(found))
 
 async def load_and_expand_links():
-    """
-    Reads raw_links.txt, follows URLs if needed, and extracts individual configs.
-    """
     if not os.path.exists(RAW_LINKS_FILE):
-        print(f"[ERROR] {RAW_LINKS_FILE} missing!")
+        log_event(f"[ERROR] {RAW_LINKS_FILE} not found!")
         return []
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [PARSER] Reading {RAW_LINKS_FILE}...")
-    
+    log_event(f"[PARSER] Opening {RAW_LINKS_FILE}...")
     with open(RAW_LINKS_FILE, "r") as f:
         raw_lines = [line.strip() for line in f if line.strip()]
 
     all_configs = []
-    
     for entry in raw_lines:
         if entry.startswith("http"):
-            print(f"  > [FETCHING] {entry} ...")
+            log_event(f"[FETCH] Requesting: {entry}")
             try:
-                # Use curl to fetch the subscription content
-                cmd = ["curl", "-s", "-L", "-m", "15", entry]
+                # Using curl with follow-redirects and insecure flags
+                cmd = ["curl", "-s", "-L", "-k", "-m", "20", entry]
                 proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stdout, _ = await proc.communicate()
                 content = stdout.decode(errors='ignore')
                 
+                # Check for Base64 (many subs use it)
+                if not content.startswith(('vless', 'vmess', 'ss', 'trojan')):
+                    try:
+                        content = base64.b64decode(content).decode('utf-8')
+                        log_event("  ├─ Base64 detected and decoded successfully.")
+                    except: pass
+
                 configs = extract_configs_from_text(content)
-                print(f"    - Found {len(configs)} configs in this URL.")
+                log_event(f"  └─ Success! Extracted {len(configs)} nodes.")
                 all_configs.extend(configs)
             except Exception as e:
-                print(f"    - [ERROR] Failed to fetch {entry}: {e}")
+                log_event(f"  └─ [ERROR] Fetch failed: {e}")
         else:
-            # It's a direct config line
-            all_configs.append(entry)
+            extracted = extract_configs_from_text(entry)
+            all_configs.extend(extracted if extracted else [entry])
 
-    # Filtering through dead cache
     dead_ids = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             dead_ids = set(line.strip() for line in f)
 
     unique_configs = list(set(all_configs))
-    final_list = [c for c in unique_configs if get_md5(c) not in dead_ids]
+    final_list = []
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [PARSER] Total unique: {len(unique_configs)} | Active: {len(final_list)} (Banned: {len(unique_configs)-len(final_list)})")
+    for c in unique_configs:
+        if get_md5(c) in dead_ids:
+            continue
+        final_list.append(c)
+    
+    log_event(f"[PARSER] Unique: {len(unique_configs)} | Fresh: {len(final_list)} | Banned: {len(unique_configs)-len(final_list)}")
     return final_list
 
 async def check_url_anchor(link, rule):
@@ -129,8 +140,8 @@ async def check_url_anchor(link, rule):
     try:
         cmd = [
             "curl", "-s", "-L", "--proxy", link, rule["url"],
-            "--connect-timeout", "6", "-m", "10",
-            "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "--connect-timeout", "10", "-m", "15",
+            "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "-w", "%{url_effective}"
         ]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -151,74 +162,66 @@ async def measure_speed(link):
     try:
         cmd = [
             "curl", "-L", "--proxy", link, SPEED_TEST_URL,
-            "-o", "/dev/null", "-s", "--max-time", "12", "-w", "%{http_code}"
+            "-o", "/dev/null", "-s", "--max-time", "20", "-w", "%{http_code}"
         ]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, _ = await proc.communicate()
         duration = time.time() - start
-        
-        if stdout.decode().strip() == "200":
+        if stdout.decode().strip() == "200" and duration > 0:
             return round(8 / duration, 2)
         return 0
     except: return 0
 
 async def async_headless_audit(link):
-    """
-    Real-time detailed trace of each proxy's journey.
-    """
-    trace = []
+    proxy_id = get_md5(link)[:8]
+    log_event(f"[AUDIT:{proxy_id}] >>> PROBING: {link[:50]}...")
     
-    # Speed check
+    # 1. Speed
     speed = await measure_speed(link)
-    trace.append(f"SPEED: {speed} Mbps")
+    log_event(f"  [>] Speed: {speed} Mbps")
     
-    # Burst Anchors
+    # 2. Regional Anchors
     tasks = [check_url_anchor(link, rule) for rule in CHECK_RULES]
     results = await asyncio.gather(*tasks)
-    
-    ai_studio = results[0]
-    spotify = results[1]
-    
-    trace.append(f"AI_STUDIO: {ai_studio['status']} ({ai_studio['ms']}ms) -> {ai_studio['url']}")
-    trace.append(f"SPOTIFY: {spotify['status']} ({spotify['ms']}ms) -> {spotify['url']}")
+    ai_studio, spotify = results[0], results[1]
+    log_event(f"  [>] AI_Studio: {ai_studio['status']} ({ai_studio['ms']}ms)")
+    log_event(f"  [>] Spotify: {spotify['status']} ({spotify['ms']}ms)")
 
-    # Gemini Validation
+    # 3. Gemini App Test
     gemini_res = await check_url_anchor(link, {"url": MAIN_GEMINI_APP, "must_not_contain": ["unsupported"]})
     gemini_ok = (gemini_res["status"] == "OK" and "/app" in gemini_res["url"])
-    trace.append(f"GEMINI_APP: {'SUCCESS' if gemini_ok else 'FAILED'} ({gemini_res['ms']}ms) -> {gemini_res['url']}")
+    log_event(f"  [>] Gemini_Web: {'PASSED' if gemini_ok else 'FAILED'} ({gemini_res['ms']}ms)")
 
-    # Decision logic
+    # Final Verdict
     category = "DEAD"
     if gemini_ok and ai_studio['status'] == "OK" and speed >= 15:
         category = "ELITE"
     elif gemini_ok and speed >= 0.5:
         category = "STABLE"
-    elif speed >= 15:
+    elif speed >= 10:
         category = "FAST_NO_GOOGLE"
 
-    # Real-time console report
-    print(f"--- [PROBING] {link[:50]}... ---")
-    for step in trace: print(f"  [>] {step}")
-    print(f"  [!!!] RESULT: {category}\n")
-
+    log_event(f"[AUDIT:{proxy_id}] VERDICT: {category}\n")
     return link, category, speed
 
 async def main_orchestrator():
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] --- STARTING REAL-TIME SIERRA AUDIT ---")
+    log_event("--- SIERRA ORCHESTRATOR ONLINE ---")
     
+    # Init files
+    for f_name in RESULT_FILES:
+        if not os.path.exists(f_name): open(f_name, 'a').close()
+
     manage_cache_lifecycle()
-    # Step 1: Expand subscriptions and raw configs
     links = await load_and_expand_links()
-    total = len(links)
     
-    if total == 0:
-        print("No configs found to check.")
+    if not links:
+        log_event("No fresh nodes to audit. Check dead_cache.txt or raw_links.txt content.")
         return
 
     # Process chunks
-    for i in range(0, total, MAX_CONCURRENT_PROXIES):
+    for i in range(0, len(links), MAX_CONCURRENT_PROXIES):
         chunk = links[i : i + MAX_CONCURRENT_PROXIES]
-        print(f"--- Processing Batch {i//MAX_CONCURRENT_PROXIES + 1} ({len(chunk)} nodes) ---")
+        log_event(f"--- Processing Batch {i//MAX_CONCURRENT_PROXIES + 1} ---")
         
         tasks = [async_headless_audit(link) for link in chunk]
         results = await asyncio.gather(*tasks)
@@ -231,9 +234,9 @@ async def main_orchestrator():
                 target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
                 remove_proxy_from_all_files(link)
                 with open(target, "a") as f:
-                    f.write(f"{link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%H:%M')}\n")
+                    f.write(f"{link} # [{cat}] {speed}Mbps | {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] --- AUDIT COMPLETE ---")
+    log_event("--- AUDIT COMPLETE ---")
 
 if __name__ == "__main__":
     asyncio.run(main_orchestrator())
