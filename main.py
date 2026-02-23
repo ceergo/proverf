@@ -37,7 +37,7 @@ def log_event(msg):
     print(f"[{timestamp}] {msg}", flush=True)
 
 def get_md5(text):
-    return hashlib.md5(text.encode()).hexdigest()
+    return hashlib.md5(text.strip().encode()).hexdigest()
 
 def manage_cache_lifecycle():
     now = datetime.now()
@@ -76,6 +76,7 @@ async def fetch_external_subs(urls):
     all_links = []
     async with aiohttp.ClientSession() as session:
         for url in urls:
+            url = url.strip()
             if not url.startswith('http'): continue
             log_event(f"[FETCH] Downloading subscription: {url}")
             try:
@@ -85,6 +86,8 @@ async def fetch_external_subs(urls):
                         found = extract_configs_from_text(content)
                         log_event(f"  [+] Found {len(found)} nodes in sub.")
                         all_links.extend(found)
+                    else:
+                        log_event(f"  [!] Sub returned status {resp.status}")
             except Exception as e:
                 log_event(f"  [!] Failed to fetch sub: {e}")
     return all_links
@@ -297,14 +300,25 @@ async def main_orchestrator():
     fetched_links = await fetch_external_subs(sub_urls)
     total_candidates = list(set(direct_configs + fetched_links))
     
-    log_event(f"[PARSER] Total candidate nodes: {len(total_candidates)}")
+    log_event(f"[PARSER] Total candidate nodes after extraction: {len(total_candidates)}")
 
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
-            dead_cache = set(line.strip() for line in f)
+            for line in f:
+                line = line.strip()
+                if line: dead_cache.add(line)
+        log_event(f"[CACHE] Loaded {len(dead_cache)} dead hashes.")
 
-    fresh_links = [l for l in total_candidates if get_md5(l) not in dead_cache]
+    fresh_links = []
+    for l in total_candidates:
+        link_hash = get_md5(l)
+        if link_hash not in dead_cache:
+            fresh_links.append(l)
+        else:
+            # Optional debug: log_event(f"  [-] Skipping cached: {link_hash}")
+            pass
+
     log_event(f"[PARSER] Processing {len(fresh_links)} fresh nodes.")
 
     base_port = 10808
