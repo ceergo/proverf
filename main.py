@@ -127,6 +127,7 @@ async def audit_single_link(link, local_port, semaphore):
     async with semaphore:
         l_hash = get_md5(link)
         async with file_lock:
+            # Check files in the result folder directly
             for path in Config.RESULT_FILES.values():
                 if os.path.exists(path) and l_hash in open(path).read():
                     stats.processed += 1
@@ -151,6 +152,7 @@ async def audit_single_link(link, local_port, semaphore):
             elif speed >= 1.0: cat = "FAST_NO_GOOGLE"; stats.fast += 1
             else: stats.dead += 1
             
+            # log_node_details will handle record keeping
             log_node_details(link, parsed, cat, speed, ping)
             return link, cat, speed, ping
         except Exception as e:
@@ -175,12 +177,11 @@ async def main_orchestrator():
             
     with open(Config.LOCK_FILE, "w") as f: f.write(str(os.getpid()))
     try:
+        # Initial cleanup
         kill_process_by_name("xray")
         manage_cache_lifecycle(Config)
         
-        if os.path.exists(Config.TEMP_POOL_FILE):
-            os.remove(Config.TEMP_POOL_FILE)
-
+        # We always start with fresh pool from raw_links.txt
         total_pool = await prepare_task_pool(Config)
             
         if not total_pool: 
@@ -196,8 +197,8 @@ async def main_orchestrator():
         if not active_nodes:
             return
             
-        # Logging start event directly from filesystem context
-        log_event(f"📁 Пул задач загружен из {Config.RAW_LINKS_FILE}. Всего: {stats.total}", "SYSTEM")
+        # Logging based on the actual file content state
+        log_event(f"📊 Пул активных задач: {stats.total}. Проверка запущена.", "SYSTEM")
         
         semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_TESTS)
         
@@ -206,14 +207,13 @@ async def main_orchestrator():
             tasks = [audit_single_link(l, Config.BASE_PORT + (idx % Config.PORT_RANGE), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
             
-            # Writing results to files
+            # Save results (writing to files in the result folder)
             await save_audit_results(results, Config, file_lock)
             
-            # Here we pull info from folders/files to show in terminal
-            # log_progress inside logger should be updated to read actual file line counts
+            # log_progress will sync terminal output with folder contents
             log_progress()
             
-        # Final summary also pulls data from results folder
+        # log_summary pulls final stats from folder
         log_summary()
     finally:
         if os.path.exists(Config.LOCK_FILE): os.remove(Config.LOCK_FILE)
