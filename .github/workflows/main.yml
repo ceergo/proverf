@@ -9,7 +9,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Явное разрешение на запись для GitHub Actions
+      contents: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -27,59 +27,93 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip wget curl jq psmisc
 
-      - name: Install Xray-core (Matching main.py path)
+      - name: Initialize Config Structure
         run: |
-          echo "Installing Xray-core as local binary..."
-          wget -O xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          mkdir -p ./xray_temp
-          unzip -q xray.zip -d ./xray_temp
-          # Перемещаем в корень, как указано в XRAY_PATH = "xray"
-          mv ./xray_temp/xray ./xray
-          chmod +x ./xray
-          rm -rf xray.zip ./xray_temp
-          ./xray -version
-
-      - name: Install Librespeed CLI (Matching main.py path)
-        run: |
-          echo "Installing Librespeed CLI as local binary..."
-          LATEST_URL=$(curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
-          | grep "browser_download_url.*linux_amd64.tar.gz" \
-          | cut -d : -f 2,3 \
-          | tr -d \" | xargs)
+          mkdir -p TEMPLATES
+          # Create CONFIG.JSON with updated file names if it doesn't exist
+          if [ ! -f CONFIG.JSON ]; then
+            cat <<EOF > CONFIG.JSON
+            {
+              "FILES": {
+                "RAW_LINKS": "raw_links.txt",
+                "DEAD_CACHE": "dead_cache.txt",
+                "CLEANUP_LOG": "last_cleanup.txt",
+                "LOCK_FILE": "system.lock",
+                "TEMP_POOL": "audit_snapshot.json",
+                "RESULTS": {
+                  "ELITE": "Elite_Gemini.txt",
+                  "STABLE": "Stable_Chat.txt",
+                  "FAST": "Fast_NoGoogle.txt"
+                }
+              },
+              "BINARIES": {
+                "XRAY": "./xray",
+                "LIBRESPEED": "./librespeed-cli"
+              },
+              "NETWORK": {
+                "MAX_CONCURRENT": 10,
+                "BATCH_SIZE": 20,
+                "BASE_PORT": 20000,
+                "XRAY_WAIT": 4,
+                "TIMEOUT_SUB": 30
+              },
+              "THRESHOLDS": {
+                "SPEED_ELITE": 5.0,
+                "SPEED_STABLE": 1.5,
+                "SPEED_FAST": 0.5
+              },
+              "URLS": {
+                "GEMINI_CHECK": "https://generativelanguage.googleapis.com",
+                "GOOGLE_CHECK": "https://www.google.com"
+              }
+            }
+          EOF
+          fi
           
-          if [ -z "$LATEST_URL" ]; then
-            LATEST_URL="https://github.com/librespeed/speedtest-cli/releases/download/v1.1.5/librespeed-cli-linux-amd64.tar.gz"
+          # Create XRAY Template if it doesn't exist
+          if [ ! -f TEMPLATES/XRAY_BASE.JSON ]; then
+            cat <<EOF > TEMPLATES/XRAY_BASE.JSON
+            {
+              "log": {"loglevel": "none"},
+              "inbounds": [{"port": 1080, "protocol": "socks", "settings": {"udp": true}}],
+              "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+            }
+          EOF
           fi
 
+      - name: Install Xray-core
+        run: |
+          wget -O xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q xray.zip xray -d .
+          chmod +x ./xray
+          rm xray.zip
+
+      - name: Install Librespeed CLI
+        run: |
+          LATEST_URL=$(curl -s https://api.github.com/repos/librespeed/speedtest-cli/releases/latest \
+          | jq -r '.assets[] | select(.name | contains("linux_amd64.tar.gz")) | .browser_download_url')
           wget -O librespeed.tar.gz $LATEST_URL
           tar -xzf librespeed.tar.gz
-          # Перемещаем в корень, как указано в LIBRESPEED_PATH = "./librespeed-cli"
-          find . -name "librespeed-cli*" -exec mv {} ./librespeed-cli \;
+          mv librespeed-cli* ./librespeed-cli
           chmod +x ./librespeed-cli
-          ./librespeed-cli --version
+          rm librespeed.tar.gz
 
       - name: Run Sieve Orchestrator
         run: |
-          # Убеждаемся, что зависимости установлены
-          pip install aiohttp requests
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python main.py
+          pip install aiohttp
+          # Ensure critical files exist before running MAIN.PY
+          touch raw_links.txt dead_cache.txt
+          python MAIN.PY
 
-      - name: Commit and Push Results (Prevention of Loop)
+      - name: Commit and Push Results
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
-          # Создаем файлы, если их нет
-          touch Elite_Gemini.txt Stable_Chat.txt Fast_NoGoogle.txt dead_cache.txt last_cleanup.txt
-          
           git add .
-          
-          # Проверяем наличие изменений. 
-          # Флаг [skip ci] в сообщении коммита предотвращает повторный запуск workflow при пуше.
           if ! git diff --staged --quiet; then
-            git commit -m "Deep Audit Complete: $(date -u) [skip ci]"
+            # Using [skip ci] to prevent recursive workflow triggers
+            git commit -m "Audit: $(date -u) [skip ci]"
             git push origin main
           else
-            echo "No changes to commit."
+            echo "No changes detected to commit."
           fi
