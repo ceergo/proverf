@@ -134,7 +134,6 @@ async def audit_single_link(link, local_port, semaphore):
         parsed = parse_proxy_link(link)
         if not parsed:
             stats.processed += 1; stats.dead += 1
-            log_node_details(link, None, "INVALID_FORMAT")
             return link, "INVALID_FORMAT", 0, 0
         config_path = f"cfg_{l_hash[:6]}_{local_port}.json"
         with open(config_path, "w") as f: json.dump(generate_xray_config(parsed, local_port), f)
@@ -151,6 +150,7 @@ async def audit_single_link(link, local_port, semaphore):
             elif is_gemini or (0.1 < speed < 1.0): cat = "STABLE"; stats.stable += 1
             elif speed >= 1.0: cat = "FAST_NO_GOOGLE"; stats.fast += 1
             else: stats.dead += 1
+            
             log_node_details(link, parsed, cat, speed, ping)
             return link, cat, speed, ping
         except Exception as e:
@@ -171,22 +171,19 @@ async def main_orchestrator():
     """Main entry point: orchestrates the overall audit process."""
     if os.path.exists(Config.LOCK_FILE):
         if time.time() - os.path.getmtime(Config.LOCK_FILE) < 1200:
-            print("🚫 Бот уже запущен."); sys.exit(0)
+            sys.exit(0)
+            
     with open(Config.LOCK_FILE, "w") as f: f.write(str(os.getpid()))
     try:
-        log_event("🚀 СТАРТ: Режим локального аудита", "SYSTEM")
         kill_process_by_name("xray")
         manage_cache_lifecycle(Config)
         
-        # --- CLEANUP: Explicitly remove temp pool to avoid stuck states ---
         if os.path.exists(Config.TEMP_POOL_FILE):
             os.remove(Config.TEMP_POOL_FILE)
 
-        # Always prepare fresh pool from raw_links.txt
         total_pool = await prepare_task_pool(Config)
             
         if not total_pool: 
-            log_event(f"🛑 Очередь пуста. Проверьте входной файл: {Config.RAW_LINKS_FILE}", "ERROR")
             return
 
         dead_cache = set()
@@ -197,19 +194,26 @@ async def main_orchestrator():
         stats.total = len(active_nodes)
         
         if not active_nodes:
-            log_event("📭 Все ноды в очереди уже проверены или помечены как мертвые.", "INFO")
             return
             
-        log_event(f"🏁 Запуск аудита {stats.total} нод...", "SYSTEM")
+        # Logging start event directly from filesystem context
+        log_event(f"📁 Пул задач загружен из {Config.RAW_LINKS_FILE}. Всего: {stats.total}", "SYSTEM")
+        
         semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_TESTS)
         
         for i in range(0, len(active_nodes), Config.BATCH_SIZE):
             batch = active_nodes[i : i + Config.BATCH_SIZE]
             tasks = [audit_single_link(l, Config.BASE_PORT + (idx % Config.PORT_RANGE), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
+            
+            # Writing results to files
             await save_audit_results(results, Config, file_lock)
+            
+            # Here we pull info from folders/files to show in terminal
+            # log_progress inside logger should be updated to read actual file line counts
             log_progress()
             
+        # Final summary also pulls data from results folder
         log_summary()
     finally:
         if os.path.exists(Config.LOCK_FILE): os.remove(Config.LOCK_FILE)
