@@ -105,17 +105,22 @@ def extract_server_identity(link):
 def clean_garbage(link):
     """
     Strict cleaning for ALL proxy protocols.
-    Removes emojis, country flags, and ANY non-ASCII characters everywhere.
-    Ensures the link is 100% safe for Xray binary.
+    Removes country codes (like #RU), emojis, flags, and ANY non-ASCII characters.
+    Ensures the link starts strictly with the protocol name.
     """
     if not link:
         return ""
     
-    # 1. Remove all whitespaces and invisible control characters
+    # 1. First, find the start of the actual protocol to remove any prefixes like #RU_ or #US_
+    protocol_match = re.search(r'(vless|vmess|trojan|ss|hy2)://', link, re.IGNORECASE)
+    if protocol_match:
+        link = link[protocol_match.start():]
+    
+    # 2. Remove all whitespaces
     link = "".join(link.split())
     
-    # 2. Strict ASCII filter: Keep only characters from space (32) to ~ (126)
-    # This automatically kills emojis, flags (like 🇬🇧), and special unicode.
+    # 3. Strict ASCII filter: Keep only characters from space (32) to ~ (126)
+    # This removes flags (like 🇬🇧), non-latin country names, and hidden trash.
     link = "".join(char for char in link if 31 < ord(char) < 127)
     
     return link
@@ -126,19 +131,22 @@ def extract_configs_from_text(text, depth=0):
     """
     if depth > 1: return []
     
+    # Pattern to find the protocol and everything after it until a space/quote/bracket
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
-    text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ')
+    
+    # Normalize text by removing common separators that might be stuck to the link
+    text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ').replace('|', ' ')
     
     found_raw = []
     matches = re.finditer(pattern, text, re.IGNORECASE)
     for m in matches:
         link = m.group(0).rstrip('.,;)]}>')
-        # Apply strict cleaning immediately
+        # Apply strict cleaning (removes #RU, emojis, and trash)
         link = clean_garbage(link)
         if '@' in link or link.startswith('vmess://'):
             found_raw.append(link)
 
-    # Base64 nested extraction
+    # Base64 nested extraction (for providers that wrap list in B64)
     if not found_raw and len(text.strip()) > 50 and depth == 0:
         try:
             potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
@@ -368,7 +376,7 @@ async def main_orchestrator():
     """
     Main orchestration loop with atomic deduplication and forced exit.
     """
-    log_event("⚡ СИСТЕМА SIERRA: УЛЬТРА-ОЧИСТКА (ASCII ONLY) ⚡")
+    log_event("⚡ СИСТЕМА SIERRA: ОЧИСТКА ПРЕФИКСОВ (#RU) ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
