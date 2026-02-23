@@ -104,13 +104,24 @@ def extract_server_identity(link):
 
 def clean_garbage(link):
     """
-    Removes emojis and junk from the end of the link.
+    Deep cleaning for ALL protocols. Removes emojis from URI and control chars from tags.
     """
     link = link.strip()
-    if link.lower().startswith("vmess://"):
-        if "#" in link:
-            return link.split("#")[0]
-    return link
+    link = re.split(r'\s+', link)[0]
+    
+    if "://" not in link:
+        return link
+        
+    protocol, rest = link.split("://", 1)
+    
+    if "#" in rest:
+        body, remark = rest.split("#", 1)
+        body = re.sub(r'[^\x21-\x7E]', '', body)
+        remark = re.sub(r'[\x00-\x1F\x7F]', '', remark)
+        return f"{protocol}://{body}#{remark}"
+    else:
+        rest = re.sub(r'[^\x21-\x7E]', '', rest)
+        return f"{protocol}://{rest}"
 
 def extract_configs_from_text(text, depth=0):
     """
@@ -276,12 +287,10 @@ async def check_gemini_access(socks_port):
 
 async def measure_speed_librespeed(socks_port):
     """
-    Measure download speed using Librespeed CLI with extended timeout.
+    Measure download speed using Librespeed CLI with extended 25s timeout.
     """
     try:
-        # Увеличиваем длительность теста и общий таймаут ожидания
         cmd = [LIBRESPEED_PATH, "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "15"]
-        # Используем wait_for для предотвращения зависания процесса
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
@@ -297,7 +306,7 @@ async def measure_speed_librespeed(socks_port):
 
 async def audit_single_link(link, local_port, semaphore):
     """
-    Full audit cycle with ATOMIC LOGGING and SPEED WARM-UP.
+    Full audit cycle with global cleaning and speed fallback logic.
     """
     async with semaphore:
         proxy_id = get_md5(link)[:6]
@@ -315,19 +324,18 @@ async def audit_single_link(link, local_port, semaphore):
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(6.0) # Прогрев Xray
+            await asyncio.sleep(6.0) # Warm-up
             
-            # Проверка Gemini
+            # Gemini Check
             is_gemini, g_msg = await check_gemini_access(local_port)
             
-            # Если Gemini работает, пробуем замерить скорость
+            # Speed Check
             speed, ping = await measure_speed_librespeed(local_port)
             
             verdict = "МЕРТВАЯ 💀"
             emoji = "💀"
             
-            # Логика определения категории
-            if speed >= 0.8 and is_gemini:
+            if is_gemini and speed >= 0.8:
                 verdict = "ELITE ⭐"
                 emoji = "⭐"
             elif is_gemini:
@@ -336,7 +344,7 @@ async def audit_single_link(link, local_port, semaphore):
             elif speed >= 1.0:
                 verdict = "FAST (No Google) ⚡"
                 emoji = "⚡"
-            elif speed > 0.05:
+            elif speed > 0.02:
                 verdict = "STABLE 🟢"
                 emoji = "🟢"
             
@@ -361,14 +369,22 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main loop with server deduplication and atomic reporting.
+    Main loop with atomic reporting and GUARANTEED EXIT.
     """
-    log_event("⚡ СИСТЕМА SIERRA ЗАПУЩЕНА (FIX: SPEED MEASUREMENT) ⚡")
+    log_event("⚡ СИСТЕМА SIERRA: ЗАПУСК ПОЛНОГО ЦИКЛА ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
         print(f"❌ Файл {RAW_LINKS_FILE} не найден.")
         return
+
+    # Загружаем текущие найденные ноды, чтобы не дублировать в файлы
+    existing_nodes = set()
+    for rf in RESULT_FILES:
+        if os.path.exists(rf):
+            with open(rf, "r") as f:
+                for line in f:
+                    if "://" in line: existing_nodes.add(get_md5(line.strip()))
 
     with open(RAW_LINKS_FILE, "r") as f:
         content = f.read()
@@ -385,11 +401,12 @@ async def main_orchestrator():
     
     for link in all_raw:
         identity = extract_server_identity(link)
-        if identity not in seen_servers:
+        link_md5 = get_md5(link)
+        if identity not in seen_servers and link_md5 not in existing_nodes:
             seen_servers.add(identity)
             unique_candidates.append(link)
     
-    print(f"\n💎 ИТОГО: Найдено {len(all_raw)} ссылок. Уникальных IP:Port: {len(unique_candidates)}", flush=True)
+    print(f"\n💎 ИТОГО: Найдено {len(all_raw)} ссылок. К проверке (уникальные): {len(unique_candidates)}", flush=True)
 
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
@@ -397,28 +414,47 @@ async def main_orchestrator():
             dead_cache = {l.strip() for l in f if l.strip()}
 
     fresh = [l for l in unique_candidates if get_md5(l) not in dead_cache]
-    print(f"🆕 К проверке: {len(fresh)} нод\n", flush=True)
+    print(f"🆕 Свежих нод для теста: {len(fresh)}\n", flush=True)
+
+    if not fresh:
+        log_event("✅ Новых ссылок для проверки нет. Завершаю работу.")
+        sys.exit(0)
 
     for rf in RESULT_FILES:
         if not os.path.exists(rf): open(rf, "w").close()
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
+    
+    # Обработка
     for i in range(0, len(fresh), BATCH_SIZE):
         batch = fresh[i : i + BATCH_SIZE]
-        log_event(f"📦 ОБРАБОТКА ПАЧКИ #{i//BATCH_SIZE + 1}...")
+        log_event(f"📦 ПАЧКА #{i//BATCH_SIZE + 1} ({len(batch)} нод)...")
         tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
         results = await asyncio.gather(*tasks)
         
+        # Атомарная запись результатов после каждой пачки
         for link, cat, speed in results:
             if cat == "DEAD":
-                with open(DEAD_CACHE_FILE, "a") as f: f.write(get_md5(link) + "\n")
+                with open(DEAD_CACHE_FILE, "a") as f:
+                    f.write(get_md5(link) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
             else:
                 target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
                 if target:
                     with open(target, "a") as f:
                         f.write(f"{link}\n")
+                        f.flush()
+                        os.fsync(f.fileno())
 
-    print(f"\n✅ АУДИТ ЗАВЕРШЕН.")
+    log_event("🏁 АУДИТ ПОЛНОСТЬЮ ЗАВЕРШЕН. ВЫХОД.")
+    sys.exit(0) # Гарантированный выход из процесса
 
 if __name__ == "__main__":
-    asyncio.run(main_orchestrator())
+    try:
+        asyncio.run(main_orchestrator())
+    except SystemExit:
+        pass # Корректный выход через sys.exit
+    except Exception as e:
+        log_event(f"🔴 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        sys.exit(1)
