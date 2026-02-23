@@ -14,19 +14,23 @@ from urllib.parse import urlparse, parse_qs, unquote
 import aiohttp
 
 # --- INITIALIZE CONFIG ---
+# We use CONFIG.JSON instead of config.py to keep the core clean and modular.
 CONFIG_PATH = "CONFIG.JSON"
 XRAY_TEMPLATE_PATH = "TEMPLATES/XRAY_BASE.JSON"
 
 def load_config():
+    """Loads global settings from a JSON file."""
     if not os.path.exists(CONFIG_PATH):
-        print(f"CRITICAL ERROR: {CONFIG_PATH} not found!")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] CRITICAL ERROR: {CONFIG_PATH} not found!")
+        # Create a default config if it doesn't exist to prevent crash (optional)
         sys.exit(1)
     with open(CONFIG_PATH, "r") as f:
         return json.load(f)
 
+# Load config once at startup
 CFG = load_config()
 
-# Helper accessors
+# Helper accessors for cleaner code
 FILES = CFG["FILES"]
 BINS = CFG["BINARIES"]
 NET = CFG["NETWORK"]
@@ -34,12 +38,12 @@ LIMITS = CFG["THRESHOLDS"]
 URLS = CFG["URLS"]
 
 def log_event(msg):
-    """Real-time logging with timestamps."""
+    """Real-time logging with timestamps for GitHub Actions logs."""
     timestamp = datetime.now().strftime('%H:%M:%S')
     print(f"[{timestamp}] {msg}", flush=True)
 
 def kill_process_by_name(name):
-    """Forcefully kills processes by name."""
+    """Forcefully kills processes to ensure ports are free."""
     try:
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/F", "/IM", f"{name}.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -48,7 +52,7 @@ def kill_process_by_name(name):
     except: pass
 
 def get_md5(text):
-    """Generates unique hash for a node link."""
+    """Generates unique hash for a node link for caching."""
     try:
         if "vmess://" in text:
             normalized = text.strip().split('#')[0]
@@ -59,7 +63,7 @@ def get_md5(text):
         return hashlib.md5(text.strip().encode()).hexdigest()
 
 def manage_cache_lifecycle():
-    """Cleans the dead nodes cache based on interval in config."""
+    """Cleans the dead nodes cache every 72 hours."""
     now = datetime.now()
     log_file = FILES["CLEANUP_LOG"]
     dead_file = FILES["DEAD_CACHE"]
@@ -77,7 +81,7 @@ def manage_cache_lifecycle():
         with open(log_file, "w") as f_out: f_out.write(now.isoformat())
 
 def extract_server_identity(link):
-    """Identifies the server by Host:Port."""
+    """Identifies the server by Host:Port to avoid testing mirrors."""
     try:
         if "://" not in link: return link
         if link.lower().startswith("vmess://"):
@@ -93,7 +97,7 @@ def extract_server_identity(link):
     except: return link
 
 def clean_garbage(link):
-    """Strictly cleans proxy links."""
+    """Strictly cleans proxy links from junk characters."""
     if not link: return ""
     protocol_match = re.search(r'(vless|vmess|trojan|ss|hy2)://', link, re.IGNORECASE)
     if protocol_match: link = link[protocol_match.start():]
@@ -103,7 +107,7 @@ def clean_garbage(link):
     return link
 
 def extract_configs_from_text(text, depth=0):
-    """Recursively extracts proxy links from text."""
+    """Recursively extracts proxy links from raw text or Base64 layers."""
     if depth > 1: return []
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
     text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ').replace('|', ' ')
@@ -123,7 +127,7 @@ def extract_configs_from_text(text, depth=0):
     return list(set(found_raw))
 
 async def fetch_external_subs(urls):
-    """Asynchronously fetches content from subscription URLs."""
+    """Asynchronously fetches content from external subscription URLs."""
     all_links = []
     timeout = aiohttp.ClientTimeout(total=NET["TIMEOUT_SUB"], connect=10, sock_read=15)
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -139,7 +143,7 @@ async def fetch_external_subs(urls):
     return all_links
 
 def parse_proxy_link(link):
-    """Universal parser for proxy protocols."""
+    """Universal parser for all supported proxy protocols."""
     try:
         if link.lower().startswith("vmess://"):
             b64_part = re.sub(r'[^a-zA-Z0-9+/=]', '', link[8:].split("#")[0])
@@ -163,14 +167,13 @@ def parse_proxy_link(link):
                 "flow": params.get("flow", ""), "pbk": params.get("pbk", ""), "sid": params.get("sid", ""), "fp": params.get("fp", "chrome")
             }
         elif link.lower().startswith("ss://"):
-            # Simplified SS parsing for brevity
             return {"protocol": "shadowsocks", "security": "none", "type": "tcp"}
     except: return None
 
 def generate_xray_config(parsed_link, local_port):
-    """Generates Xray config using a base template."""
+    """Generates Xray config using the provided external template."""
     if not os.path.exists(XRAY_TEMPLATE_PATH):
-        # Fallback if template missing
+        # Emergency fallback if TEMPLATES folder is missing
         return {"log": {"loglevel": "none"}, "inbounds": [{"port": local_port, "protocol": "socks"}]}
     
     with open(XRAY_TEMPLATE_PATH, "r") as f:
@@ -202,7 +205,7 @@ def generate_xray_config(parsed_link, local_port):
     return config
 
 async def check_gemini_access(socks_port):
-    """Checks Gemini accessibility."""
+    """Checks if the node can access Google AI Studio (Gemini)."""
     try:
         cmd = ["curl", "-s", "-L", "-k", "--proxy", f"socks5h://127.0.0.1:{socks_port}", URLS["GEMINI_CHECK"], "--connect-timeout", "10", "-m", "15", "-w", "%{http_code}"]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -212,7 +215,7 @@ async def check_gemini_access(socks_port):
     except: return False, "ERR"
 
 async def measure_speed_librespeed(socks_port):
-    """Measures speed using Librespeed CLI."""
+    """Measures download speed using Librespeed CLI."""
     try:
         if not os.path.exists(BINS["LIBRESPEED"]): return 0.0, 0.0
         cmd = [BINS["LIBRESPEED"], "--proxy", f"socks5://127.0.0.1:{socks_port}", "--json", "--duration", "15"]
@@ -228,7 +231,7 @@ async def measure_speed_librespeed(socks_port):
     except: return 0.0, 0.0
 
 async def audit_single_link(link, local_port, semaphore):
-    """Audit cycle for a single node."""
+    """Full audit cycle for a single proxy link."""
     async with semaphore:
         link_md5 = get_md5(link)
         parsed = parse_proxy_link(link)
@@ -260,10 +263,10 @@ async def audit_single_link(link, local_port, semaphore):
             if os.path.exists(config_path): os.remove(config_path)
 
 async def main_orchestrator():
-    """Main Orchestrator Logic."""
+    """Main execution flow and node management."""
     lock = FILES["LOCK_FILE"]
     if os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 600:
-        print("🚫 System locked.")
+        print("🚫 System locked. Another instance might be running.")
         sys.exit(0)
     
     with open(lock, "w") as f: f.write(str(os.getpid()))
@@ -312,10 +315,11 @@ async def main_orchestrator():
                 elif cat in FILES["RESULTS"]:
                     with open(FILES["RESULTS"][cat], "a") as f: f.write(f"{link}\n")
             
+            # Update temp pool to allow resuming after crash
             with open(FILES["TEMP_POOL"], "w") as f: json.dump(candidates[i+NET["BATCH_SIZE"]:], f)
 
         if os.path.exists(FILES["TEMP_POOL"]): os.remove(FILES["TEMP_POOL"])
-        log_event("🏁 Audit Finished.")
+        log_event("🏁 Audit Finished Successfully.")
         
     finally:
         if os.path.exists(lock): os.remove(lock)
