@@ -111,7 +111,7 @@ def clean_garbage(link):
     if not link:
         return ""
     
-    # 1. First, find the start of the actual protocol to remove any prefixes like #RU_ or #US_
+    # 1. Find the start of the protocol to remove prefixes
     protocol_match = re.search(r'(vless|vmess|trojan|ss|hy2)://', link, re.IGNORECASE)
     if protocol_match:
         link = link[protocol_match.start():]
@@ -119,8 +119,7 @@ def clean_garbage(link):
     # 2. Remove all whitespaces
     link = "".join(link.split())
     
-    # 3. Strict ASCII filter: Keep only characters from space (32) to ~ (126)
-    # This removes flags (like 🇬🇧), non-latin country names, and hidden trash.
+    # 3. Strict ASCII filter (32-126) to kill emojis and trash
     link = "".join(char for char in link if 31 < ord(char) < 127)
     
     return link
@@ -131,22 +130,17 @@ def extract_configs_from_text(text, depth=0):
     """
     if depth > 1: return []
     
-    # Pattern to find the protocol and everything after it until a space/quote/bracket
     pattern = r'(vless|vmess|trojan|ss|hy2)://[^\s"\'<>|]+'
-    
-    # Normalize text by removing common separators that might be stuck to the link
     text = text.replace('\\n', ' ').replace('\\r', ' ').replace(',', ' ').replace('|', ' ')
     
     found_raw = []
     matches = re.finditer(pattern, text, re.IGNORECASE)
     for m in matches:
         link = m.group(0).rstrip('.,;)]}>')
-        # Apply strict cleaning (removes #RU, emojis, and trash)
         link = clean_garbage(link)
         if '@' in link or link.startswith('vmess://'):
             found_raw.append(link)
 
-    # Base64 nested extraction (for providers that wrap list in B64)
     if not found_raw and len(text.strip()) > 50 and depth == 0:
         try:
             potential_b64 = re.findall(r'[a-zA-Z0-9+/]{50,}=*', text)
@@ -331,7 +325,7 @@ async def audit_single_link(link, local_port, semaphore):
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(6.0) # Grace period
+            await asyncio.sleep(6.0) 
             
             is_gemini, g_msg = await check_gemini_access(local_port)
             speed, ping = await measure_speed_librespeed(local_port)
@@ -339,7 +333,6 @@ async def audit_single_link(link, local_port, semaphore):
             verdict = "МЕРТВАЯ 💀"
             emoji = "💀"
             
-            # Smart Classification
             if is_gemini and speed >= 0.8:
                 verdict = "ELITE ⭐"
                 emoji = "⭐"
@@ -374,57 +367,73 @@ async def audit_single_link(link, local_port, semaphore):
 
 async def main_orchestrator():
     """
-    Main orchestration loop with atomic deduplication and forced exit.
+    Main orchestration loop. Focuses on filtering existing results to avoid double testing.
     """
-    log_event("⚡ СИСТЕМА SIERRA: ОЧИСТКА ПРЕФИКСОВ (#RU) ⚡")
+    log_event("⚡ СИСТЕМА SIERRA: ЖЕСТКИЙ ФИЛЬТР MD5 ⚡")
     manage_cache_lifecycle()
     
     if not os.path.exists(RAW_LINKS_FILE): 
         print(f"❌ Файл {RAW_LINKS_FILE} не найден.")
         return
 
-    # Loading existing good nodes to skip duplicate testing
+    # 1. Загружаем все MD5 уже рабочих ссылок, чтобы не проверять их по второму кругу
     existing_hashes = set()
     for rf in RESULT_FILES:
         if os.path.exists(rf):
             with open(rf, "r") as f:
                 for line in f:
-                    if "://" in line: existing_hashes.add(get_md5(line.strip()))
+                    clean_line = line.strip()
+                    if "://" in clean_line:
+                        existing_hashes.add(get_md5(clean_line))
+    
+    log_event(f"📊 В базе уже есть {len(existing_hashes)} рабочих нод. Они будут пропущены.")
 
+    # 2. Читаем RAW файл
     with open(RAW_LINKS_FILE, "r") as f:
         content = f.read()
     
     raw_found = extract_configs_from_text(content)
     sub_urls = [l.strip() for l in content.split() if l.startswith('http')]
     
+    # 3. Собираем внешние подписки
     print(f"🔗 Сбор из {len(sub_urls)} источников...", flush=True)
     fetched = await fetch_external_subs(sub_urls)
     
+    # 4. Сливаем всё в один список и убираем дубликаты
     all_raw = list(set(raw_found + fetched))
+    
+    # 5. Дедупликация по IP:Port и проверка MD5 по базе результатов
     seen_servers = set()
     unique_candidates = []
     
     for link in all_raw:
-        identity = extract_server_identity(link)
         link_md5 = get_md5(link)
-        if identity not in seen_servers and link_md5 not in existing_hashes:
+        
+        # Если ссылка УЖЕ в Elite/Stable/Fast — выкидываем её из списка на проверку
+        if link_md5 in existing_hashes:
+            continue
+            
+        identity = extract_server_identity(link)
+        if identity not in seen_servers:
             seen_servers.add(identity)
             unique_candidates.append(link)
     
-    print(f"\n💎 ИТОГО: Найдено {len(all_raw)} ссылок. Уникальных для теста: {len(unique_candidates)}", flush=True)
+    print(f"\n💎 ИТОГО: Найдено {len(all_raw)} ссылок.")
+    print(f"🆕 Действительно новых для теста: {len(unique_candidates)}", flush=True)
 
+    # 6. Кэш мертвых нод (очищается раз в 72 часа)
     dead_cache = set()
     if os.path.exists(DEAD_CACHE_FILE):
         with open(DEAD_CACHE_FILE, "r") as f:
             dead_cache = {l.strip() for l in f if l.strip()}
 
     fresh = [l for l in unique_candidates if get_md5(l) not in dead_cache]
-    print(f"🆕 Свежих нод для проверки: {len(fresh)}\n", flush=True)
-
+    
     if not fresh:
-        log_event("✅ Новых ссылок для проверки нет. Завершаю работу.")
+        log_event("✅ Новых ссылок для проверки не найдено. Завершаю цикл.")
         sys.exit(0)
 
+    # Ensure result files exist
     for rf in RESULT_FILES:
         if not os.path.exists(rf): open(rf, "w").close()
 
@@ -436,7 +445,6 @@ async def main_orchestrator():
         tasks = [audit_single_link(l, BASE_PORT + (idx % MAX_CONCURRENT_TESTS), semaphore) for idx, l in enumerate(batch)]
         results = await asyncio.gather(*tasks)
         
-        # Immediate save and flush after each batch
         for link, cat, speed in results:
             if cat == "DEAD":
                 with open(DEAD_CACHE_FILE, "a") as f:
@@ -446,12 +454,13 @@ async def main_orchestrator():
             else:
                 target = {"ELITE": ELITE_GEMINI, "STABLE": STABLE_CHAT, "FAST_NO_GOOGLE": FAST_NO_GOOGLE}.get(cat)
                 if target:
+                    # Double check before writing
                     with open(target, "a") as f:
                         f.write(f"{link}\n")
                         f.flush()
                         os.fsync(f.fileno())
 
-    log_event("🏁 АУДИТ ПОЛНОСТЬЮ ЗАВЕРШЕН. ГАРАНТИРОВАННЫЙ ВЫХОД.")
+    log_event("🏁 АУДИТ ПОЛНОСТЬЮ ЗАВЕРШЕН.")
     sys.exit(0) 
 
 if __name__ == "__main__":
