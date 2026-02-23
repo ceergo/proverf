@@ -1,116 +1,28 @@
 import os
 import json
 import subprocess
-import hashlib
 import time
 import asyncio
-import re
 import sys
-import base64
-import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
-import aiohttp
 
 # --- INTERNAL IMPORTS ---
 from config import Config
-from logger import stats, log_event, log_node_details, log_error_details
+from logger import (
+    stats, log_event, log_node_details, log_error_details, 
+    log_progress, log_summary, kill_process_by_name, get_md5,
+    manage_cache_lifecycle, prepare_task_pool, save_audit_results
+)
 
 # Global lock for file operations
 file_lock = asyncio.Lock()
 
-# --- UTILS ---
-def kill_process_by_name(name):
-    """Terminates zombie processes."""
-    try:
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/IM", f"{name}.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            subprocess.run(["pkill", "-9", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except:
-        pass
-
-def get_md5(text):
-    """Generates unique hash for link deduplication."""
-    try:
-        # Normalize: remove remarks and parameters for cleaner hashing
-        if "vmess://" in text:
-            normalized = text.strip().split('#')[0]
-        else:
-            normalized = text.strip().split('#')[0].split('?')[0]
-        return hashlib.md5(normalized.encode()).hexdigest()
-    except:
-        return hashlib.md5(text.strip().encode()).hexdigest()
-
-def manage_cache_lifecycle():
-    """Wipes dead cache every 72 hours."""
-    now = datetime.now()
-    if os.path.exists(Config.CLEANUP_LOG):
-        with open(Config.CLEANUP_LOG, "r") as f:
-            try:
-                last_run = datetime.fromisoformat(f.read().strip())
-                if now - last_run > timedelta(hours=72):
-                    log_event("🧹 Ротация кэша: Очистка списка мертвых нод...", "SYSTEM")
-                    if os.path.exists(Config.DEAD_CACHE_FILE): 
-                        os.remove(Config.DEAD_CACHE_FILE)
-                    with open(Config.CLEANUP_LOG, "w") as f_out: 
-                        f_out.write(now.isoformat())
-            except: pass
-    else:
-        with open(Config.CLEANUP_LOG, "w") as f_out: f_out.write(now.isoformat())
-
-# --- DATA PARSING & EXTRACTION ---
-def extract_server_identity(link):
-    """Extracts IP:Port to prevent redundant server checks."""
-    try:
-        if "://" not in link: return link
-        if link.lower().startswith("vmess://"):
-            b64_part = link[8:].split("#")[0]
-            b64_part = re.sub(r'[^a-zA-Z0-9+/=]', '', b64_part)
-            b64_part += "=" * (-len(b64_part) % 4)
-            decoded = base64.b64decode(b64_part).decode('utf-8', errors='ignore')
-            data = json.loads(re.search(r'\{.*\}', decoded).group())
-            return f"{data.get('add')}:{data.get('port')}"
-        match = re.search(r'@([^:/?#]+):(\d+)', link)
-        if match: return f"{match.group(1)}:{match.group(2)}"
-        parsed = urlparse(link)
-        return parsed.netloc or link
-    except: return link
-
-def clean_garbage(link):
-    """Strips invisible characters and junk from links."""
-    if not link: return ""
-    link = link.strip()
-    protocol_match = re.search(Config.CLEANUP_PATTERN, link, re.IGNORECASE)
-    if protocol_match: link = link[protocol_match.start():]
-    link = "".join(char for char in link if 32 < ord(char) < 127)
-    if not link.lower().startswith("vmess://") and "#" in link:
-        link = link.split("#", 1)[0]
-    return link
-
-def extract_configs_from_text(text, depth=0):
-    """Deep recursive link extractor (Regex + Base64)."""
-    if depth > 1 or not text: return []
-    clean_text = text.replace('\\n', '\n').replace('\\r', '\r')
-    found_raw = []
-    
-    for m in re.finditer(Config.PROTOCOL_PATTERN, clean_text, re.IGNORECASE):
-        l = clean_garbage(m.group(0))
-        if l: found_raw.append(l)
-
-    if not found_raw and depth == 0:
-        try:
-            trimmed = clean_text.strip()
-            if len(trimmed) > 20 and re.match(r'^[a-zA-Z0-9+/=\s]+$', trimmed):
-                padded = trimmed.replace('\n', '').replace('\r', '') + "=" * (-len(trimmed) % 4)
-                decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-                found_raw.extend(extract_configs_from_text(decoded, depth + 1))
-        except: pass
-    return list(set(found_raw))
-
+# --- DATA PARSING ---
 def parse_proxy_link(link):
     """Converts raw URI to structured dict for Xray."""
     try:
+        import base64, re
         if link.lower().startswith("vmess://"):
             b64 = re.sub(r'[^a-zA-Z0-9+/=]', '', link[8:].split("#")[0])
             b64 += "=" * (-len(b64) % 4)
@@ -135,6 +47,7 @@ def parse_proxy_link(link):
                 "pbk": params.get("pbk", ""), "sid": params.get("sid", "")
             }
         elif link.lower().startswith("ss://"):
+            import base64
             parts = link[5:].split("#")
             main, remark = parts[0], (unquote(parts[1]) if len(parts) > 1 else "SS")
             if "@" in main:
@@ -164,7 +77,6 @@ def generate_xray_config(parsed, local_port):
         }],
         "outbounds": [{"tag": "direct", "protocol": "freedom"}]
     }
-    
     if proto == "hy2":
         proxy = {"tag": "proxy", "protocol": "hysteria2", "settings": {"server": parsed["host"], "port": parsed["port"], "auth": parsed["uuid"]},
                  "streamSettings": {"network": "udp", "security": "tls", "tlsSettings": {"serverName": parsed.get("sni", parsed["host"]), "allowInsecure": True}}}
@@ -177,7 +89,6 @@ def generate_xray_config(parsed, local_port):
             proxy["settings"]["servers"] = [{"address": parsed["host"], "port": parsed["port"], "password": parsed["uuid"]}]
         elif proto == "shadowsocks":
             proxy["settings"]["servers"] = [{"address": parsed["host"], "port": parsed["port"], "method": parsed["method"], "password": parsed["password"]}]
-        
         ss = proxy["streamSettings"]
         if ss["network"] == "ws": ss["wsSettings"] = {"path": parsed["path"]}
         elif ss["network"] == "grpc": ss["grpcSettings"] = {"serviceName": parsed.get("path", "")}
@@ -185,7 +96,6 @@ def generate_xray_config(parsed, local_port):
             ss["realitySettings"] = {"show": False, "fingerprint": parsed.get("fp", "chrome"), "serverName": parsed.get("sni", ""), "publicKey": parsed.get("pbk", ""), "shortId": parsed.get("sid", "")}
         elif ss["security"] == "tls":
             ss["tlsSettings"] = {"serverName": parsed.get("sni", ""), "allowInsecure": True}
-
     config["outbounds"].insert(0, proxy)
     return config
 
@@ -216,45 +126,33 @@ async def audit_single_link(link, local_port, semaphore):
     """Full lifecycle check for a single proxy link."""
     async with semaphore:
         l_hash = get_md5(link)
-        
-        # 1. Skip if already in results
         async with file_lock:
             for path in Config.RESULT_FILES.values():
                 if os.path.exists(path) and l_hash in open(path).read():
                     stats.processed += 1
                     return link, "ALREADY_DONE", 0, 0
-
-        # 2. Parse link
         parsed = parse_proxy_link(link)
         if not parsed:
             stats.processed += 1; stats.dead += 1
             log_node_details(link, None, "INVALID_FORMAT")
             return link, "INVALID_FORMAT", 0, 0
-        
         config_path = f"cfg_{l_hash[:6]}_{local_port}.json"
         with open(config_path, "w") as f: json.dump(generate_xray_config(parsed, local_port), f)
-        
         xray_proc = None
         try:
             xray_proc = subprocess.Popen([Config.XRAY_PATH, "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(4) # Wait for bootstrap
-            
+            await asyncio.sleep(4)
             is_gemini, gemini_code = await check_gemini_access(local_port)
             speed, ping = 0.0, 0.0
-            
             if is_gemini or (gemini_code not in ["ERR", "000"]):
                 speed, ping = await measure_speed_librespeed(local_port)
-            
-            # Classification
             cat = "DEAD"
             if is_gemini and speed >= 0.8: cat = "ELITE"; stats.elite += 1
             elif is_gemini or (0.1 < speed < 1.0): cat = "STABLE"; stats.stable += 1
             elif speed >= 1.0: cat = "FAST_NO_GOOGLE"; stats.fast += 1
             else: stats.dead += 1
-            
             log_node_details(link, parsed, cat, speed, ping)
             return link, cat, speed, ping
-            
         except Exception as e:
             stats.errors += 1
             log_error_details(link, e, context="AUDIT")
@@ -270,88 +168,36 @@ async def audit_single_link(link, local_port, semaphore):
 
 # --- MAIN FLOW ---
 async def main_orchestrator():
-    """Main entry point: reads raw_links.txt and audits content."""
+    """Main entry point: orchestrates the overall audit process."""
     if os.path.exists(Config.LOCK_FILE):
         if time.time() - os.path.getmtime(Config.LOCK_FILE) < 1200:
             print("🚫 Бот уже запущен."); sys.exit(0)
-    
     with open(Config.LOCK_FILE, "w") as f: f.write(str(os.getpid()))
-    
     try:
-        log_event("🚀 СТАРТ: Режим локального аудита (raw_links.txt)", "SYSTEM")
+        log_event("🚀 СТАРТ: Режим локального аудита", "SYSTEM")
         kill_process_by_name("xray")
-        manage_cache_lifecycle()
-
-        total_pool = []
-        if os.path.exists(Config.TEMP_POOL_FILE):
-            log_event("♻️ Восстановление очереди...", "INFO")
-            with open(Config.TEMP_POOL_FILE, "r") as f: total_pool = json.load(f)
-
-        if not total_pool:
-            if not os.path.exists(Config.RAW_LINKS_FILE):
-                log_event(f"❌ Файл {Config.RAW_LINKS_FILE} не найден!", "ERROR"); return
-            
-            with open(Config.RAW_LINKS_FILE, "r") as f:
-                content = f.read()
-                raw_extracted = extract_configs_from_text(content)
-            
-            log_event(f"📖 Загружено из файла: {len(raw_extracted)} нод.", "SUCCESS")
-            
-            # Filter duplicates and history
-            history = set()
-            for path in Config.RESULT_FILES.values():
-                if os.path.exists(path):
-                    with open(path) as f: 
-                        for line in f: history.add(get_md5(line))
-            
-            seen_ips = set()
-            for l in raw_extracted:
-                h, ip = get_md5(l), extract_server_identity(l)
-                if h not in history and ip not in seen_ips:
-                    total_pool.append(l)
-                    seen_ips.add(ip)
-            
-            log_event(f"🎯 Итого новых нод к проверке: {len(total_pool)}", "SUCCESS")
-            random.shuffle(total_pool)
-            with open(Config.TEMP_POOL_FILE, "w") as f: json.dump(total_pool, f)
-
-        # Apply dead cache filter
+        manage_cache_lifecycle(Config)
+        total_pool = await prepare_task_pool(Config)
+        if not total_pool: return
         dead_cache = set()
         if os.path.exists(Config.DEAD_CACHE_FILE):
             with open(Config.DEAD_CACHE_FILE) as f: dead_cache = {line.strip() for line in f}
-        
         active_nodes = [l for l in total_pool if get_md5(l) not in dead_cache]
         stats.total = len(active_nodes)
-        
         if not active_nodes:
-            log_event("📭 Очередь пуста. Новых нод нет.", "INFO")
+            log_event("📭 Очередь пуста.", "INFO")
             if os.path.exists(Config.TEMP_POOL_FILE): os.remove(Config.TEMP_POOL_FILE)
             return
-
         log_event(f"🏁 Запуск аудита {stats.total} нод...", "SYSTEM")
         semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_TESTS)
-        
         for i in range(0, len(active_nodes), Config.BATCH_SIZE):
             batch = active_nodes[i : i + Config.BATCH_SIZE]
             tasks = [audit_single_link(l, Config.BASE_PORT + (idx % Config.PORT_RANGE), semaphore) for idx, l in enumerate(batch)]
             results = await asyncio.gather(*tasks)
-            
-            async with file_lock:
-                for link, cat, speed, ping in results:
-                    if cat == "ALREADY_DONE": continue
-                    h = get_md5(link)
-                    if cat in ["ERROR", "DEAD", "INVALID_FORMAT"]:
-                        with open(Config.DEAD_CACHE_FILE, "a") as f: f.write(f"{h}\n")
-                    else:
-                        target = Config.RESULT_FILES.get(cat)
-                        if target: 
-                            with open(target, "a") as f: f.write(f"{link}\n")
-            
-            # Update snapshot
+            await save_audit_results(results, Config, file_lock)
             with open(Config.TEMP_POOL_FILE, "w") as f: json.dump(active_nodes[i + Config.BATCH_SIZE:], f)
-            log_event(f"Прогресс: Elite: {stats.elite} | Stable: {stats.stable} | Dead: {stats.dead}", "INFO")
-
-        log_event(f"🏆 Готово! Найдено Elite: {stats.elite}, Stable: {stats.stable}", "SUCCESS")
+            log_progress()
+        log_summary()
         if os.path.exists(Config.TEMP_POOL_FILE): os.remove(Config.TEMP_POOL_FILE)
     finally:
         if os.path.exists(Config.LOCK_FILE): os.remove(Config.LOCK_FILE)
